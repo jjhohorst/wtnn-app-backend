@@ -8,6 +8,9 @@ const User = require('../models/User');
 
 const JWT_SECRET = process.env.JWT_SECRET;
 
+const normalizeEmail = (value) => String(value || '').trim().toLowerCase();
+const looksLikeBcryptHash = (value) => /^\$2[aby]\$\d{2}\$/.test(String(value || ''));
+
 const tokenAuthMiddleware = (req, res, next) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ message: 'Token required' });
@@ -88,7 +91,8 @@ router.post(
     }
 
     try {
-      const { firstName, lastName, customerName, email, password } = req.body;
+      const { firstName, lastName, customerName, password } = req.body;
+      const email = normalizeEmail(req.body.email);
 
       const existingUser = await User.findOne({ email });
       if (existingUser) {
@@ -128,14 +132,29 @@ router.post(
     }
 
     try {
-      const { email, password } = req.body;
+      const email = normalizeEmail(req.body.email);
+      const password = String(req.body.password || '');
 
       const user = await User.findOne({ email }).populate('customerName', 'customerName customerLogo');
       if (!user) {
         return res.status(401).json({ message: 'Invalid email or password' });
       }
 
-      const isMatch = await bcrypt.compare(password, user.passwordHash);
+      let isMatch = false;
+      const storedPasswordHash = String(user.passwordHash || '');
+
+      if (looksLikeBcryptHash(storedPasswordHash)) {
+        isMatch = await bcrypt.compare(password, storedPasswordHash);
+      } else {
+        // Legacy support: if plain text was stored in passwordHash, allow one login and upgrade to bcrypt.
+        isMatch = storedPasswordHash === password;
+        if (isMatch) {
+          const salt = await bcrypt.genSalt(10);
+          user.passwordHash = await bcrypt.hash(password, salt);
+          await user.save();
+        }
+      }
+
       if (!isMatch) {
         return res.status(401).json({ message: 'Invalid email or password' });
       }

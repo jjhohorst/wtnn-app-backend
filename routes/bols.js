@@ -213,7 +213,7 @@ router.get('/railcars/unloads', authorizeRoles(['customer', 'internal', 'admin']
   }
 });
 
-router.get('/reports/truck-weigh-ins', authorizeRoles(['customer', 'internal', 'admin']), async (req, res) => {
+router.get('/reports/truck-weigh-ins', authorizeRoles(['internal', 'admin']), async (req, res) => {
   try {
     const monthWindow = parseMonthWindow(req.query.year, req.query.month);
     if (!monthWindow) {
