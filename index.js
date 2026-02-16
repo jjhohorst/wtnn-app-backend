@@ -3,6 +3,7 @@
 require('dotenv').config();
 
 const fs = require('fs');
+const http = require('http');
 const https = require('https');
 const express = require('express');
 const cors = require('cors');
@@ -61,13 +62,30 @@ const errorHandler = require('./errorHandler');
 // other app.use() statements...
 app.use(errorHandler);
 
-// Read certificate and key files
-const sslOptions = {
-  key: fs.readFileSync('C:/mycerts/key.pem'),
-  cert: fs.readFileSync('C:/mycerts/cert.pem')
-};
+const shouldUseLocalHttps = process.env.USE_LOCAL_HTTPS === 'true';
+const sslKeyPath = process.env.SSL_KEY_PATH || 'C:/mycerts/key.pem';
+const sslCertPath = process.env.SSL_CERT_PATH || 'C:/mycerts/cert.pem';
 
-// Create HTTPS server with your Express app
-https.createServer(sslOptions, app).listen(PORT, () => {
-  console.log(`HTTPS server is running on port ${PORT}`);
-});
+if (shouldUseLocalHttps) {
+  const certFilesExist = fs.existsSync(sslKeyPath) && fs.existsSync(sslCertPath);
+
+  if (certFilesExist) {
+    const sslOptions = {
+      key: fs.readFileSync(sslKeyPath),
+      cert: fs.readFileSync(sslCertPath),
+    };
+
+    https.createServer(sslOptions, app).listen(PORT, () => {
+      console.log(`HTTPS server is running on port ${PORT}`);
+    });
+  } else {
+    console.warn(`USE_LOCAL_HTTPS=true but cert files were not found at ${sslKeyPath} and ${sslCertPath}. Falling back to HTTP.`);
+    http.createServer(app).listen(PORT, () => {
+      console.log(`HTTP server is running on port ${PORT}`);
+    });
+  }
+} else {
+  http.createServer(app).listen(PORT, () => {
+    console.log(`HTTP server is running on port ${PORT}`);
+  });
+}
