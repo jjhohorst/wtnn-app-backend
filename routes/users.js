@@ -1,11 +1,14 @@
 const express = require('express');
 const router = express.Router();
 const { body, validationResult } = require('express-validator');
+const bcrypt = require('bcryptjs');
 const User = require('../models/User');
 const {
   requireAuth,
   authorizeRoles,
 } = require('../middleware/auth');
+
+const normalizeEmail = (value) => String(value || '').trim().toLowerCase();
 
 const sanitizeSelfUpdate = (payload = {}) => {
   const blocked = ['role', 'customerName', 'passwordHash', 'email'];
@@ -24,7 +27,14 @@ router.post(
     body('lastName').notEmpty().withMessage('Last name is required'),
     body('customerName').notEmpty().withMessage('Customer name is required'),
     body('email').notEmpty().isEmail().withMessage('Invalid email format'),
-    body('passwordHash').notEmpty().withMessage('Password is required'),
+    body('password')
+      .optional({ checkFalsy: true })
+      .isLength({ min: 8 })
+      .withMessage('Password must be at least 8 characters long'),
+    body('passwordHash')
+      .optional({ checkFalsy: true })
+      .isLength({ min: 8 })
+      .withMessage('Password must be at least 8 characters long'),
     body('role')
       .notEmpty()
       .isIn(['customer', 'admin', 'internal'])
@@ -37,7 +47,26 @@ router.post(
     }
 
     try {
-      const newUser = new User(req.body);
+      const email = normalizeEmail(req.body.email);
+      const rawPassword = String(req.body.password || req.body.passwordHash || '').trim();
+
+      if (!rawPassword) {
+        return res.status(400).json({ message: 'Password is required' });
+      }
+
+      const existingUser = await User.findOne({ email });
+      if (existingUser) {
+        return res.status(400).json({ message: 'Email already exists' });
+      }
+
+      const salt = await bcrypt.genSalt(10);
+      const hashedPassword = await bcrypt.hash(rawPassword, salt);
+
+      const newUser = new User({
+        ...req.body,
+        email,
+        passwordHash: hashedPassword,
+      });
       const savedUser = await newUser.save();
       res.status(201).json({ message: 'User created successfully', user: savedUser });
     } catch (error) {
@@ -46,6 +75,57 @@ router.post(
         return res.status(400).json({ message: 'Email already exists' });
       }
       res.status(500).json({ message: 'Server error while creating user' });
+    }
+  }
+);
+
+router.post(
+  '/internal',
+  authorizeRoles(['admin']),
+  [
+    body('firstName').notEmpty().withMessage('First name is required'),
+    body('lastName').notEmpty().withMessage('Last name is required'),
+    body('customerName').notEmpty().withMessage('Customer name is required'),
+    body('email').notEmpty().isEmail().withMessage('Invalid email format'),
+    body('password')
+      .notEmpty()
+      .isLength({ min: 8 })
+      .withMessage('Password must be at least 8 characters long'),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    try {
+      const email = normalizeEmail(req.body.email);
+      const existingUser = await User.findOne({ email });
+      if (existingUser) {
+        return res.status(400).json({ message: 'Email already exists' });
+      }
+
+      const salt = await bcrypt.genSalt(10);
+      const hashedPassword = await bcrypt.hash(String(req.body.password), salt);
+
+      const newUser = new User({
+        firstName: req.body.firstName,
+        lastName: req.body.lastName,
+        customerName: req.body.customerName,
+        email,
+        passwordHash: hashedPassword,
+        role: 'internal',
+        isActive: true,
+      });
+
+      const savedUser = await newUser.save();
+      return res.status(201).json({ message: 'Internal user created successfully', user: savedUser });
+    } catch (error) {
+      console.error('Error creating internal user:', error);
+      if (error.code === 11000) {
+        return res.status(400).json({ message: 'Email already exists' });
+      }
+      return res.status(500).json({ message: 'Server error while creating internal user' });
     }
   }
 );
