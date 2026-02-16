@@ -15,6 +15,29 @@ const {
 const isSameCustomer = (a, b) => String(a) === String(b);
 const trimToString = (value) => String(value || '').trim();
 
+const parseMonthWindow = (yearValue, monthValue) => {
+  const now = new Date();
+  const year = Number(yearValue) || now.getFullYear();
+  const month = Number(monthValue) || now.getMonth() + 1;
+
+  if (!Number.isInteger(year) || !Number.isInteger(month) || month < 1 || month > 12) {
+    return null;
+  }
+
+  const start = new Date(Date.UTC(year, month - 1, 1, 0, 0, 0, 0));
+  const end = new Date(Date.UTC(year, month, 1, 0, 0, 0, 0));
+  return { year, month, start, end };
+};
+
+const csvEscape = (value) => {
+  if (value == null) return '';
+  const raw = String(value);
+  if (raw.includes('"') || raw.includes(',') || raw.includes('\n')) {
+    return `"${raw.replace(/"/g, '""')}"`;
+  }
+  return raw;
+};
+
 const findActiveRailcarShipmentBol = async ({ customerId, railcarID }) => {
   const normalizedCustomerId = trimToString(customerId);
   const normalizedRailcarID = trimToString(railcarID);
@@ -187,6 +210,143 @@ router.get('/railcars/unloads', authorizeRoles(['customer', 'internal', 'admin']
   } catch (err) {
     console.error('Error fetching railcar unload summary:', err);
     res.status(500).json({ message: 'Server error while fetching railcar unload summary' });
+  }
+});
+
+router.get('/reports/truck-weigh-ins', authorizeRoles(['customer', 'internal', 'admin']), async (req, res) => {
+  try {
+    const monthWindow = parseMonthWindow(req.query.year, req.query.month);
+    if (!monthWindow) {
+      return res.status(400).json({ message: 'Invalid year/month query parameters' });
+    }
+
+    const query = {
+      weighInTime: { $gte: monthWindow.start, $lt: monthWindow.end },
+    };
+
+    if (isCustomerUser(req)) {
+      const tokenCustomerId = customerIdFromToken(req);
+      if (!tokenCustomerId) {
+        return res.status(403).json({ message: 'Customer scope is missing from token' });
+      }
+      query.customerName = tokenCustomerId;
+    } else if (req.query.customerId) {
+      if (!isValidObjectId(req.query.customerId)) {
+        return res.status(400).json({ message: 'Invalid customerId query parameter' });
+      }
+      query.customerName = req.query.customerId;
+    }
+
+    const weighIns = await BOL.find(query)
+      .sort({ weighInTime: -1 })
+      .populate('customerName', 'customerName')
+      .populate('materialName', 'materialName refNum')
+      .populate('projectName', 'projectName')
+      .populate('orderNumber', 'orderNumber')
+      .lean();
+
+    const rows = weighIns.map((bol) => {
+      const customerId = String(bol.customerName?._id || bol.customerName || '');
+      const customerName = bol.customerName?.customerName || 'Unknown Customer';
+      const weighInTime = bol.weighInTime ? new Date(bol.weighInTime) : null;
+
+      return {
+        bolId: String(bol._id),
+        customerId,
+        customerName,
+        orderNumber: bol.orderNumber?.orderNumber || '',
+        bolDate: bol.bolDate || null,
+        weighInTime: weighInTime ? weighInTime.toISOString() : null,
+        truckID: bol.truckID || '',
+        trailerID: bol.trailerID || '',
+        railcarID: bol.railcarID || '',
+        materialName: bol.materialName?.materialName || '',
+        materialRefNum: bol.materialName?.refNum || '',
+        locationName: bol.projectName?.projectName || '',
+        tareWeight: Number(bol.tareWeight || 0),
+        status: bol.status || 'Draft',
+      };
+    });
+
+    const byCustomerMap = new Map();
+    rows.forEach((row) => {
+      if (!byCustomerMap.has(row.customerId)) {
+        byCustomerMap.set(row.customerId, {
+          customerId: row.customerId,
+          customerName: row.customerName,
+          weighInCount: 0,
+        });
+      }
+      const bucket = byCustomerMap.get(row.customerId);
+      bucket.weighInCount += 1;
+    });
+
+    const byCustomer = [...byCustomerMap.values()].sort((a, b) =>
+      String(a.customerName).localeCompare(String(b.customerName), undefined, { sensitivity: 'base' })
+    );
+
+    const grandTotal = {
+      weighInCount: rows.length,
+    };
+
+    if ((req.query.format || '').toLowerCase() === 'csv') {
+      const header = [
+        'Customer',
+        'Order Number',
+        'BOL ID',
+        'BOL Date',
+        'Weigh In Time',
+        'Truck ID',
+        'Trailer ID',
+        'Railcar ID',
+        'Material',
+        'Material Ref',
+        'Location',
+        'Tare Weight',
+        'Status',
+      ];
+
+      const csvRows = rows.map((row) => [
+        row.customerName,
+        row.orderNumber,
+        row.bolId,
+        row.bolDate || '',
+        row.weighInTime || '',
+        row.truckID,
+        row.trailerID,
+        row.railcarID,
+        row.materialName,
+        row.materialRefNum,
+        row.locationName,
+        row.tareWeight,
+        row.status,
+      ]);
+
+      const content = [header, ...csvRows]
+        .map((line) => line.map(csvEscape).join(','))
+        .join('\n');
+
+      const mm = String(monthWindow.month).padStart(2, '0');
+      const fileName = `truck-weigh-ins-${monthWindow.year}-${mm}.csv`;
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+      return res.status(200).send(content);
+    }
+
+    return res.status(200).json({
+      month: {
+        year: monthWindow.year,
+        month: monthWindow.month,
+        start: monthWindow.start.toISOString(),
+        end: monthWindow.end.toISOString(),
+      },
+      byCustomer,
+      grandTotal,
+      rows,
+    });
+  } catch (err) {
+    console.error('Error generating truck weigh-in report:', err);
+    return res.status(500).json({ message: 'Server error while generating truck weigh-in report' });
   }
 });
 
