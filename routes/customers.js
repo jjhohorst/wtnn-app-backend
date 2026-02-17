@@ -12,6 +12,7 @@ const {
 } = require('../middleware/auth');
 
 const isSameCustomer = (a, b) => String(a) === String(b);
+const normalizeCustomerCode = (value) => String(value || '').trim().toUpperCase();
 
 router.use(requireAuth);
 
@@ -20,7 +21,10 @@ router.post(
   authorizeRoles(['internal', 'admin']),
   [
     body('customerName').notEmpty().withMessage('Customer Name required'),
-    body('customerCode').notEmpty().withMessage('Customer Code is required'),
+    body('customerCode')
+      .optional({ checkFalsy: true })
+      .isString()
+      .withMessage('Customer Code must be text'),
     body('customerAddress1').notEmpty().withMessage('Customer Address is required'),
     body('customerCity').notEmpty().withMessage('Customer City is required'),
     body('customerState').notEmpty().withMessage('Customer State is required'),
@@ -33,10 +37,14 @@ router.post(
     }
 
     try {
-      if (req.body.customerCode) {
-        req.body.customerCode = String(req.body.customerCode).trim().toUpperCase();
+      const payload = { ...req.body };
+      const normalizedCode = normalizeCustomerCode(payload.customerCode);
+      if (normalizedCode) {
+        payload.customerCode = normalizedCode;
+      } else {
+        delete payload.customerCode;
       }
-      const newCustomer = new Customer(req.body);
+      const newCustomer = new Customer(payload);
       const savedCustomer = await newCustomer.save();
       res.status(201).json({ message: 'Customer created successfully', customer: savedCustomer });
     } catch (error) {
@@ -121,11 +129,25 @@ router.put('/:id', authorizeRoles(['internal', 'admin']), async (req, res) => {
 
   try {
     const payload = { ...req.body };
-    if (payload.customerCode) {
-      payload.customerCode = String(payload.customerCode).trim().toUpperCase();
+    const setPayload = { ...payload };
+    const unsetPayload = {};
+
+    if (Object.prototype.hasOwnProperty.call(payload, 'customerCode')) {
+      const normalizedCode = normalizeCustomerCode(payload.customerCode);
+      if (normalizedCode) {
+        setPayload.customerCode = normalizedCode;
+      } else {
+        delete setPayload.customerCode;
+        unsetPayload.customerCode = 1;
+      }
     }
 
-    const updatedCustomer = await Customer.findByIdAndUpdate(req.params.id, payload, { new: true });
+    const updateDoc = { $set: setPayload };
+    if (Object.keys(unsetPayload).length > 0) {
+      updateDoc.$unset = unsetPayload;
+    }
+
+    const updatedCustomer = await Customer.findByIdAndUpdate(req.params.id, updateDoc, { new: true, runValidators: true });
     if (!updatedCustomer) {
       return res.status(404).json({ message: 'Customer not found' });
     }

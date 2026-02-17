@@ -214,7 +214,7 @@ const renderPdfFromHtml = async (html) => {
       printBackground: true,
       margin: { top: '0.35in', right: '0.35in', bottom: '0.35in', left: '0.35in' },
     });
-    return pdf;
+    return Buffer.isBuffer(pdf) ? pdf : Buffer.from(pdf);
   } finally {
     await browser.close();
   }
@@ -257,4 +257,3 @@ module.exports = {
   buildBolPdfAttachment,
   buildBolPrintHtml,
 };
-

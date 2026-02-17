@@ -4,7 +4,7 @@ const mongoose = require('mongoose');
 
 const customerSchema = new mongoose.Schema({
   customerName: { type: String, required: true , title: 'Company Name'},
-  customerCode: { type: String, required: true, unique: true, trim: true, uppercase: true, title: 'Customer Code' },
+  customerCode: { type: String, trim: true, uppercase: true, title: 'Customer Code' },
   customerAddress1: { type: String, required: true , title: 'Company Address 1'},
   customerAddress2: { type: String, title: 'Company Address 2'},
   customerCity: { type: String, required: true , title: 'Company City'},
@@ -13,5 +13,14 @@ const customerSchema = new mongoose.Schema({
   customerLogo: { type: String, default: '' }
 
 });
+
+// Customer code is optional; enforce uniqueness only when a non-empty code exists.
+customerSchema.index(
+  { customerCode: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { customerCode: { $exists: true, $type: 'string', $ne: '' } },
+  }
+);
 
 module.exports = mongoose.model('Customer', customerSchema);

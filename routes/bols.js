@@ -619,14 +619,14 @@ router.post('/:id/email', authorizeRoles(['internal', 'admin']), async (req, res
       .populate({
         path: 'orderNumber',
         populate: [
-          { path: 'customerName', select: 'customerName customerAddress1 customerAddress2 customerCity customerState customerZip' },
+          { path: 'customerName', select: 'customerName customerLogo customerAddress1 customerAddress2 customerCity customerState customerZip' },
           { path: 'shipperName', select: 'shipperName' },
           { path: 'receiverName', select: 'receiverName billingAddress1 billingAddress2 billingCity billingState billingZip fullBillingAddress' },
           { path: 'projectName', select: 'projectName fullAddress' },
           { path: 'materialName', select: 'materialName refNum' },
         ],
       })
-      .populate('customerName', 'customerName customerAddress1 customerAddress2 customerCity customerState customerZip');
+      .populate('customerName', 'customerName customerLogo customerAddress1 customerAddress2 customerCity customerState customerZip');
 
     if (!bol) {
       return res.status(404).json({ message: 'BOL not found' });

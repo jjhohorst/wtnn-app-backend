@@ -1,3 +1,10 @@
+const normalizeAttachmentContent = (content) => {
+  if (Buffer.isBuffer(content)) return content;
+  if (content instanceof Uint8Array) return Buffer.from(content);
+  if (content instanceof ArrayBuffer) return Buffer.from(new Uint8Array(content));
+  return Buffer.from(String(content || ''), 'utf8');
+};
+
 const sendViaSmtp = async ({ to, subject, text, html, attachments = [] }) => {
   const host = process.env.SMTP_HOST;
   const port = Number(process.env.SMTP_PORT || 587);
@@ -30,7 +37,10 @@ const sendViaSmtp = async ({ to, subject, text, html, attachments = [] }) => {
     subject,
     text,
     html,
-    attachments,
+    attachments: attachments.map((attachment) => ({
+      ...attachment,
+      content: normalizeAttachmentContent(attachment.content),
+    })),
   });
 
   return true;
@@ -43,9 +53,7 @@ const toGraphAttachments = (attachments = []) =>
       '@odata.type': '#microsoft.graph.fileAttachment',
       name: attachment.filename,
       contentType: attachment.contentType || 'application/octet-stream',
-      contentBytes: Buffer.isBuffer(attachment.content)
-        ? attachment.content.toString('base64')
-        : Buffer.from(String(attachment.content), 'utf8').toString('base64'),
+      contentBytes: normalizeAttachmentContent(attachment.content).toString('base64'),
     }));
 
 const sendViaGraph = async ({ to, subject, text, html, attachments = [] }) => {
