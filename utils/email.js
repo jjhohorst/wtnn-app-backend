@@ -1,4 +1,4 @@
-const sendViaSmtp = async ({ to, subject, text, html }) => {
+const sendViaSmtp = async ({ to, subject, text, html, attachments = [] }) => {
   const host = process.env.SMTP_HOST;
   const port = Number(process.env.SMTP_PORT || 587);
   const smtpUser = process.env.SMTP_USER;
@@ -30,12 +30,25 @@ const sendViaSmtp = async ({ to, subject, text, html }) => {
     subject,
     text,
     html,
+    attachments,
   });
 
   return true;
 };
 
-const sendViaGraph = async ({ to, subject, text, html }) => {
+const toGraphAttachments = (attachments = []) =>
+  attachments
+    .filter((attachment) => attachment?.filename && attachment?.content)
+    .map((attachment) => ({
+      '@odata.type': '#microsoft.graph.fileAttachment',
+      name: attachment.filename,
+      contentType: attachment.contentType || 'application/octet-stream',
+      contentBytes: Buffer.isBuffer(attachment.content)
+        ? attachment.content.toString('base64')
+        : Buffer.from(String(attachment.content), 'utf8').toString('base64'),
+    }));
+
+const sendViaGraph = async ({ to, subject, text, html, attachments = [] }) => {
   const tenantId = process.env.MS365_TENANT_ID;
   const clientId = process.env.MS365_CLIENT_ID;
   const clientSecret = process.env.MS365_CLIENT_SECRET;
@@ -90,6 +103,7 @@ const sendViaGraph = async ({ to, subject, text, html }) => {
           content: html || text || '',
         },
         toRecipients: recipients,
+        attachments: toGraphAttachments(attachments),
       },
       saveToSentItems: 'false',
     }),
@@ -103,16 +117,16 @@ const sendViaGraph = async ({ to, subject, text, html }) => {
   return true;
 };
 
-const sendAppEmail = async ({ to, subject, text, html }) => {
+const sendAppEmail = async ({ to, subject, text, html, attachments = [] }) => {
   try {
-    const graphSent = await sendViaGraph({ to, subject, text, html });
+    const graphSent = await sendViaGraph({ to, subject, text, html, attachments });
     if (graphSent) return { sent: true, provider: 'graph' };
   } catch (err) {
     console.error('Graph email send failed:', err.message || err);
   }
 
   try {
-    const smtpSent = await sendViaSmtp({ to, subject, text, html });
+    const smtpSent = await sendViaSmtp({ to, subject, text, html, attachments });
     if (smtpSent) return { sent: true, provider: 'smtp' };
   } catch (err) {
     console.error('SMTP email send failed:', err.message || err);
@@ -124,4 +138,3 @@ const sendAppEmail = async ({ to, subject, text, html }) => {
 module.exports = {
   sendAppEmail,
 };
-

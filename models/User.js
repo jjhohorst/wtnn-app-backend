@@ -72,6 +72,11 @@ const userSchema = new mongoose.Schema({
     type: Boolean,
     default: false,
   },
+  // Customer user preference for receiving completed BOL emails
+  receiveBols: {
+    type: Boolean,
+    default: false,
+  },
   // Indicates whether the user is active
   isActive: { 
     type: Boolean, 

@@ -5,6 +5,9 @@ const router = express.Router();
 const BOL = require('../models/BOL');
 const Order = require('../models/Order');
 const Railcar = require('../models/Railcar');
+const User = require('../models/User');
+const { sendAppEmail } = require('../utils/email');
+const { buildBolPdfAttachment } = require('../utils/bol-pdf');
 const {
   requireAuth,
   authorizeRoles,
@@ -37,6 +40,8 @@ const csvEscape = (value) => {
   }
   return raw;
 };
+
+const formatAddress = (entity = {}, fields = []) => fields.map((field) => entity?.[field]).filter(Boolean).join(', ');
 
 const findActiveRailcarShipmentBol = async ({ customerId, railcarID }) => {
   const normalizedCustomerId = trimToString(customerId);
@@ -605,6 +610,147 @@ router.put('/:id', authorizeRoles(['internal', 'admin']), async (req, res) => {
   } catch (err) {
     console.error('Error updating BOL:', err);
     res.status(500).json({ message: 'Server error while updating BOL' });
+  }
+});
+
+router.post('/:id/email', authorizeRoles(['internal', 'admin']), async (req, res) => {
+  try {
+    const bol = await BOL.findById(req.params.id)
+      .populate({
+        path: 'orderNumber',
+        populate: [
+          { path: 'customerName', select: 'customerName customerAddress1 customerAddress2 customerCity customerState customerZip' },
+          { path: 'shipperName', select: 'shipperName' },
+          { path: 'receiverName', select: 'receiverName billingAddress1 billingAddress2 billingCity billingState billingZip fullBillingAddress' },
+          { path: 'projectName', select: 'projectName fullAddress' },
+          { path: 'materialName', select: 'materialName refNum' },
+        ],
+      })
+      .populate('customerName', 'customerName customerAddress1 customerAddress2 customerCity customerState customerZip');
+
+    if (!bol) {
+      return res.status(404).json({ message: 'BOL not found' });
+    }
+
+    if (bol.status !== 'Completed') {
+      return res.status(400).json({ message: 'Only completed BOLs can be emailed' });
+    }
+
+    const customerId = String(bol.customerName?._id || bol.customerName || '');
+    if (!customerId) {
+      return res.status(400).json({ message: 'BOL is missing customer association' });
+    }
+
+    const recipients = await User.find({
+      customerName: customerId,
+      isActive: { $ne: false },
+      receiveBols: true,
+    }).select('email firstName lastName');
+
+    if (!recipients.length) {
+      return res.status(400).json({
+        message: 'No active customer users are opted in to receive BOL emails.',
+      });
+    }
+
+    const customer = bol.orderNumber?.customerName || bol.customerName || {};
+    const receiver = bol.orderNumber?.receiverName || {};
+    const project = bol.orderNumber?.projectName || {};
+    const material = bol.orderNumber?.materialName || {};
+    const shipper = bol.orderNumber?.shipperName || {};
+    const orderNo = bol.orderNumber?.orderNumber || 'N/A';
+    const bolDateText = bol.bolDate ? new Date(bol.bolDate).toLocaleString() : 'N/A';
+    const weighOutText = bol.weighOutTime ? new Date(bol.weighOutTime).toLocaleString() : 'N/A';
+    const webBaseUrl = process.env.WEB_BASE_URL || process.env.FRONTEND_BASE_URL || '';
+    const bolLink = webBaseUrl ? `${webBaseUrl.replace(/\/$/, '')}/bols/${bol._id}` : '';
+
+    const customerAddress = formatAddress(customer, [
+      'customerAddress1',
+      'customerAddress2',
+      'customerCity',
+      'customerState',
+      'customerZip',
+    ]) || 'N/A';
+
+    const locationAddress = project.fullAddress || 'N/A';
+    const subject = `Completed BOL ${orderNo} - ${customer.customerName || 'Customer'}`;
+
+    const textLines = [
+      'A BOL has been completed.',
+      '',
+      `Order Number: ${orderNo}`,
+      `BOL ID: ${bol._id}`,
+      `BOL Date: ${bolDateText}`,
+      `Completed At: ${weighOutText}`,
+      `Customer: ${customer.customerName || 'N/A'}`,
+      `Customer Address: ${customerAddress}`,
+      `Material: ${material.materialName || 'N/A'}${material.refNum ? ` (${material.refNum})` : ''}`,
+      `Location: ${project.projectName || 'N/A'}`,
+      `Location Address: ${locationAddress}`,
+      `Shipper: ${shipper.shipperName || 'N/A'}`,
+      `Railcar: ${bol.railcarID || 'N/A'}`,
+      `Truck / Trailer: ${bol.truckID || 'N/A'} / ${bol.trailerID || 'N/A'}`,
+      `Total Net Weight: ${bol.netWeight ?? 'N/A'}`,
+      `Total Ton Weight: ${bol.tonWeight ?? 'N/A'}`,
+      '',
+      bolLink ? `View in portal: ${bolLink}` : 'Login to the portal to view and print this BOL.',
+    ];
+
+    const html = `
+      <div style="font-family: Arial, sans-serif; color: #1f2937;">
+        <h2 style="margin-bottom: 8px;">Completed BOL Notice</h2>
+        <p style="margin-top: 0;">A BOL has been completed and is available for review.</p>
+        <table style="border-collapse: collapse; width: 100%; max-width: 760px;">
+          <tr><td style="padding: 6px; border: 1px solid #d1d5db;"><strong>Order Number</strong></td><td style="padding: 6px; border: 1px solid #d1d5db;">${orderNo}</td></tr>
+          <tr><td style="padding: 6px; border: 1px solid #d1d5db;"><strong>BOL ID</strong></td><td style="padding: 6px; border: 1px solid #d1d5db;">${bol._id}</td></tr>
+          <tr><td style="padding: 6px; border: 1px solid #d1d5db;"><strong>BOL Date</strong></td><td style="padding: 6px; border: 1px solid #d1d5db;">${bolDateText}</td></tr>
+          <tr><td style="padding: 6px; border: 1px solid #d1d5db;"><strong>Completed At</strong></td><td style="padding: 6px; border: 1px solid #d1d5db;">${weighOutText}</td></tr>
+          <tr><td style="padding: 6px; border: 1px solid #d1d5db;"><strong>Customer</strong></td><td style="padding: 6px; border: 1px solid #d1d5db;">${customer.customerName || 'N/A'}</td></tr>
+          <tr><td style="padding: 6px; border: 1px solid #d1d5db;"><strong>Customer Address</strong></td><td style="padding: 6px; border: 1px solid #d1d5db;">${customerAddress}</td></tr>
+          <tr><td style="padding: 6px; border: 1px solid #d1d5db;"><strong>Material</strong></td><td style="padding: 6px; border: 1px solid #d1d5db;">${material.materialName || 'N/A'}${material.refNum ? ` (${material.refNum})` : ''}</td></tr>
+          <tr><td style="padding: 6px; border: 1px solid #d1d5db;"><strong>Location</strong></td><td style="padding: 6px; border: 1px solid #d1d5db;">${project.projectName || 'N/A'}</td></tr>
+          <tr><td style="padding: 6px; border: 1px solid #d1d5db;"><strong>Location Address</strong></td><td style="padding: 6px; border: 1px solid #d1d5db;">${locationAddress}</td></tr>
+          <tr><td style="padding: 6px; border: 1px solid #d1d5db;"><strong>Shipper</strong></td><td style="padding: 6px; border: 1px solid #d1d5db;">${shipper.shipperName || 'N/A'}</td></tr>
+          <tr><td style="padding: 6px; border: 1px solid #d1d5db;"><strong>Railcar</strong></td><td style="padding: 6px; border: 1px solid #d1d5db;">${bol.railcarID || 'N/A'}</td></tr>
+          <tr><td style="padding: 6px; border: 1px solid #d1d5db;"><strong>Truck / Trailer</strong></td><td style="padding: 6px; border: 1px solid #d1d5db;">${bol.truckID || 'N/A'} / ${bol.trailerID || 'N/A'}</td></tr>
+          <tr><td style="padding: 6px; border: 1px solid #d1d5db;"><strong>Total Net Weight</strong></td><td style="padding: 6px; border: 1px solid #d1d5db;">${bol.netWeight ?? 'N/A'}</td></tr>
+          <tr><td style="padding: 6px; border: 1px solid #d1d5db;"><strong>Total Ton Weight</strong></td><td style="padding: 6px; border: 1px solid #d1d5db;">${bol.tonWeight ?? 'N/A'}</td></tr>
+        </table>
+        ${bolLink ? `<p style="margin-top: 12px;"><a href="${bolLink}">Open BOL in portal</a></p>` : ''}
+      </div>
+    `;
+
+    const recipientEmails = recipients.map((user) => user.email).filter(Boolean);
+    const pdfAttachment = await buildBolPdfAttachment({
+      bol,
+      order: bol.orderNumber || {},
+      customer,
+      receiver,
+      project,
+      material,
+      shipper,
+    });
+    const sendResult = await sendAppEmail({
+      to: recipientEmails.join(','),
+      subject,
+      text: textLines.join('\n'),
+      html,
+      attachments: [pdfAttachment],
+    });
+
+    if (!sendResult.sent) {
+      return res.status(500).json({ message: 'Failed to send BOL email' });
+    }
+
+    return res.status(200).json({
+      message: `BOL email sent to ${recipientEmails.length} recipient(s).`,
+      recipientCount: recipientEmails.length,
+      recipients: recipientEmails,
+      provider: sendResult.provider,
+    });
+  } catch (err) {
+    console.error('Error sending BOL email:', err);
+    return res.status(500).json({ message: 'Server error while sending BOL email' });
   }
 });
 
