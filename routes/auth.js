@@ -5,11 +5,16 @@ const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
+const { sendAppEmail } = require('../utils/email');
 
 const JWT_SECRET = process.env.JWT_SECRET;
 
 const normalizeEmail = (value) => String(value || '').trim().toLowerCase();
 const looksLikeBcryptHash = (value) => /^\$2[aby]\$\d{2}\$/.test(String(value || ''));
+const generateTemporaryPassword = () => {
+  const random = crypto.randomBytes(18).toString('base64').replace(/[^a-zA-Z0-9]/g, '');
+  return `${random.slice(0, 8)}A1!${random.slice(8, 14)}`;
+};
 
 const tokenAuthMiddleware = (req, res, next) => {
   const authHeader = req.headers.authorization;
@@ -26,31 +31,6 @@ const tokenAuthMiddleware = (req, res, next) => {
 };
 
 const sendResetPasswordEmail = async ({ to, resetUrl }) => {
-  const host = process.env.SMTP_HOST;
-  const port = Number(process.env.SMTP_PORT || 587);
-  const smtpUser = process.env.SMTP_USER;
-  const smtpPass = process.env.SMTP_PASS;
-  const from = process.env.SMTP_FROM || smtpUser;
-
-  if (!host || !from) {
-    return false;
-  }
-
-  let nodemailer;
-  try {
-    nodemailer = require('nodemailer');
-  } catch (err) {
-    console.warn('Password reset email skipped: nodemailer is not installed');
-    return false;
-  }
-
-  const transporter = nodemailer.createTransport({
-    host,
-    port,
-    secure: port === 465,
-    auth: smtpUser && smtpPass ? { user: smtpUser, pass: smtpPass } : undefined,
-  });
-
   const subject = 'Reset your WTNN Shipment Portal password';
   const text = [
     'A request was received to reset your password.',
@@ -61,14 +41,37 @@ const sendResetPasswordEmail = async ({ to, resetUrl }) => {
     'If you did not request this, you can ignore this message.',
   ].join('\n');
 
-  await transporter.sendMail({
-    from,
+  const result = await sendAppEmail({
     to,
     subject,
     text,
   });
 
-  return true;
+  return result.sent;
+};
+
+const sendWelcomeUserEmail = async ({ to, firstName, loginUrl, temporaryPassword }) => {
+  const subject = 'Welcome to TRS Transload Portal';
+  const text = [
+    `Hello ${firstName || 'User'},`,
+    '',
+    'Your account has been created.',
+    '',
+    `Username: ${to}`,
+    `Temporary Password: ${temporaryPassword}`,
+    '',
+    `Login: ${loginUrl}`,
+    '',
+    'For security, please sign in and update your password as soon as possible.',
+  ].join('\n');
+
+  const result = await sendAppEmail({
+    to,
+    subject,
+    text,
+  });
+
+  return result.sent;
 };
 
 router.post(
@@ -78,7 +81,10 @@ router.post(
     body('lastName').notEmpty().withMessage('Last name is required'),
     body('customerName').notEmpty().withMessage('Customer name is required'),
     body('email').notEmpty().isEmail().withMessage('Must be a valid email'),
-    body('password').notEmpty().withMessage('Password is required'),
+    body('password')
+      .optional({ checkFalsy: true })
+      .isLength({ min: 8 })
+      .withMessage('Password must be at least 8 characters long'),
     body('role')
       .optional()
       .isIn(['customer'])
@@ -91,8 +97,10 @@ router.post(
     }
 
     try {
-      const { firstName, lastName, customerName, password } = req.body;
+      const { firstName, lastName, customerName } = req.body;
       const email = normalizeEmail(req.body.email);
+      const providedPassword = String(req.body.password || '').trim();
+      const rawPassword = providedPassword || generateTemporaryPassword();
 
       const existingUser = await User.findOne({ email });
       if (existingUser) {
@@ -100,7 +108,7 @@ router.post(
       }
 
       const salt = await bcrypt.genSalt(10);
-      const hashedPassword = await bcrypt.hash(password, salt);
+      const hashedPassword = await bcrypt.hash(rawPassword, salt);
 
       const newUser = new User({
         firstName,
@@ -112,7 +120,35 @@ router.post(
       });
 
       const savedUser = await newUser.save();
-      res.status(201).json({ message: 'User registered successfully', user: savedUser });
+
+      const webBaseUrl = process.env.WEB_BASE_URL || process.env.FRONTEND_BASE_URL || 'https://localhost:3000';
+      const loginUrl = `${webBaseUrl.replace(/\/$/, '')}/login`;
+      let welcomeEmailSent = false;
+
+      try {
+        welcomeEmailSent = await sendWelcomeUserEmail({
+          to: email,
+          firstName: savedUser.firstName,
+          loginUrl,
+          temporaryPassword: rawPassword,
+        });
+      } catch (mailErr) {
+        console.error('Error sending welcome email:', mailErr);
+      }
+
+      const response = {
+        message: welcomeEmailSent
+          ? 'User registered successfully. Welcome email sent.'
+          : 'User registered successfully. Welcome email not sent.',
+        user: savedUser,
+        welcomeEmailSent,
+      };
+
+      if (!welcomeEmailSent && !providedPassword) {
+        response.temporaryPassword = rawPassword;
+      }
+
+      res.status(201).json(response);
     } catch (error) {
       next(error);
     }

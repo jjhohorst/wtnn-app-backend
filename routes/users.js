@@ -2,13 +2,45 @@ const express = require('express');
 const router = express.Router();
 const { body, validationResult } = require('express-validator');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 const User = require('../models/User');
+const { sendAppEmail } = require('../utils/email');
 const {
   requireAuth,
   authorizeRoles,
 } = require('../middleware/auth');
 
 const normalizeEmail = (value) => String(value || '').trim().toLowerCase();
+
+const generateTemporaryPassword = () => {
+  const random = crypto.randomBytes(18).toString('base64').replace(/[^a-zA-Z0-9]/g, '');
+  // Ensure a minimum of 12 chars while keeping mixed case + digits.
+  return `${random.slice(0, 8)}A1!${random.slice(8, 14)}`;
+};
+
+const sendWelcomeUserEmail = async ({ to, firstName, loginUrl, temporaryPassword }) => {
+  const subject = 'Welcome to TRS Transload Portal';
+  const text = [
+    `Hello ${firstName || 'User'},`,
+    '',
+    'Your account has been created.',
+    '',
+    `Username: ${to}`,
+    `Temporary Password: ${temporaryPassword}`,
+    '',
+    `Login: ${loginUrl}`,
+    '',
+    'For security, please sign in and update your password as soon as possible.',
+  ].join('\n');
+
+  const result = await sendAppEmail({
+    to,
+    subject,
+    text,
+  });
+
+  return result.sent;
+};
 
 const sanitizeSelfUpdate = (payload = {}) => {
   const blocked = ['role', 'customerName', 'passwordHash', 'email'];
@@ -48,11 +80,8 @@ router.post(
 
     try {
       const email = normalizeEmail(req.body.email);
-      const rawPassword = String(req.body.password || req.body.passwordHash || '').trim();
-
-      if (!rawPassword) {
-        return res.status(400).json({ message: 'Password is required' });
-      }
+      const providedPassword = String(req.body.password || req.body.passwordHash || '').trim();
+      const rawPassword = providedPassword || generateTemporaryPassword();
 
       const existingUser = await User.findOne({ email });
       if (existingUser) {
@@ -68,7 +97,35 @@ router.post(
         passwordHash: hashedPassword,
       });
       const savedUser = await newUser.save();
-      res.status(201).json({ message: 'User created successfully', user: savedUser });
+
+      const webBaseUrl = process.env.WEB_BASE_URL || process.env.FRONTEND_BASE_URL || 'https://localhost:3000';
+      const loginUrl = `${webBaseUrl.replace(/\/$/, '')}/login`;
+      let welcomeEmailSent = false;
+
+      try {
+        welcomeEmailSent = await sendWelcomeUserEmail({
+          to: email,
+          firstName: savedUser.firstName,
+          loginUrl,
+          temporaryPassword: rawPassword,
+        });
+      } catch (mailErr) {
+        console.error('Error sending welcome email:', mailErr);
+      }
+
+      const response = {
+        message: welcomeEmailSent
+          ? 'User created successfully. Welcome email sent.'
+          : 'User created successfully. Welcome email not sent.',
+        user: savedUser,
+        welcomeEmailSent,
+      };
+
+      if (!welcomeEmailSent && !providedPassword) {
+        response.temporaryPassword = rawPassword;
+      }
+
+      res.status(201).json(response);
     } catch (error) {
       console.error('Error creating user:', error);
       if (error.code === 11000) {
@@ -88,7 +145,7 @@ router.post(
     body('customerName').notEmpty().withMessage('Customer name is required'),
     body('email').notEmpty().isEmail().withMessage('Invalid email format'),
     body('password')
-      .notEmpty()
+      .optional({ checkFalsy: true })
       .isLength({ min: 8 })
       .withMessage('Password must be at least 8 characters long'),
   ],
@@ -100,13 +157,15 @@ router.post(
 
     try {
       const email = normalizeEmail(req.body.email);
+      const providedPassword = String(req.body.password || '').trim();
+      const rawPassword = providedPassword || generateTemporaryPassword();
       const existingUser = await User.findOne({ email });
       if (existingUser) {
         return res.status(400).json({ message: 'Email already exists' });
       }
 
       const salt = await bcrypt.genSalt(10);
-      const hashedPassword = await bcrypt.hash(String(req.body.password), salt);
+      const hashedPassword = await bcrypt.hash(rawPassword, salt);
 
       const newUser = new User({
         firstName: req.body.firstName,
@@ -119,7 +178,35 @@ router.post(
       });
 
       const savedUser = await newUser.save();
-      return res.status(201).json({ message: 'Internal user created successfully', user: savedUser });
+
+      const webBaseUrl = process.env.WEB_BASE_URL || process.env.FRONTEND_BASE_URL || 'https://localhost:3000';
+      const loginUrl = `${webBaseUrl.replace(/\/$/, '')}/login`;
+      let welcomeEmailSent = false;
+
+      try {
+        welcomeEmailSent = await sendWelcomeUserEmail({
+          to: email,
+          firstName: savedUser.firstName,
+          loginUrl,
+          temporaryPassword: rawPassword,
+        });
+      } catch (mailErr) {
+        console.error('Error sending welcome email:', mailErr);
+      }
+
+      const response = {
+        message: welcomeEmailSent
+          ? 'Internal user created successfully. Welcome email sent.'
+          : 'Internal user created successfully. Welcome email not sent.',
+        user: savedUser,
+        welcomeEmailSent,
+      };
+
+      if (!welcomeEmailSent && !providedPassword) {
+        response.temporaryPassword = rawPassword;
+      }
+
+      return res.status(201).json(response);
     } catch (error) {
       console.error('Error creating internal user:', error);
       if (error.code === 11000) {
