@@ -15,7 +15,7 @@ const railcarSchema = new mongoose.Schema({
   leStatus: { type: String, title: 'LE Status' },
   currentStatus: {
     type: String,
-    enum: ['Inbound', 'Available', 'Released'],
+    enum: ['Inbound', 'On-Spot', 'Available', 'Released'],
     default: 'Inbound',
     title: 'Current Status',
   },

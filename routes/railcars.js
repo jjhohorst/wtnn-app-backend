@@ -129,14 +129,31 @@ const toNumberOrNull = (value) => {
   return Number.isFinite(parsed) ? parsed : null;
 };
 
-const normalizeStatus = (rawStatus = '', hasReleaseDate = false) => {
+const ON_SPOT_TRACKS = new Set(['Y-TRACK A', 'Y-TRACK B', 'Y-TRACK C']);
+
+const isOnSpotTrack = (track = '') => {
+  const normalized = String(track || '').trim().toUpperCase();
+  return ON_SPOT_TRACKS.has(normalized);
+};
+
+const normalizeStatus = (rawStatus = '', hasReleaseDate = false, track = '') => {
   if (hasReleaseDate) return 'Released';
 
   const value = String(rawStatus || '').toLowerCase().trim();
   if (value.includes('release')) return 'Released';
-  if (value.includes('avail')) return 'Available';
-  if (value === 'y' || value.includes('storage') || value.includes('loaded')) return 'Available';
-  if (value === 'l' || value === 'l ') return 'Available';
+  if (value === 'on-spot' || value === 'on spot') return 'On-Spot';
+
+  const availableLike =
+    value.includes('avail') ||
+    value === 'y' ||
+    value.includes('storage') ||
+    value.includes('loaded') ||
+    value === 'l' ||
+    value === 'l ';
+
+  if (availableLike) {
+    return isOnSpotTrack(track) ? 'On-Spot' : 'Available';
+  }
   return 'Inbound';
 };
 
@@ -413,7 +430,7 @@ const processRailcarIngest = async (inputRows) => {
     }
 
     const hasReleaseDate = Boolean(String(row.releaseDate || '').trim());
-    const normalizedStatus = normalizeStatus(row.currentStatus, hasReleaseDate);
+    const normalizedStatus = normalizeStatus(row.currentStatus, hasReleaseDate, row.track);
     const update = {
       customerName: customerId,
       carInitial,
