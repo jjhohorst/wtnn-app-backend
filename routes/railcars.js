@@ -94,6 +94,68 @@ const sendReleaseEmptyNotification = async ({ railcar, actor, customer }) => {
   });
 };
 
+const sendPlacementRequestNotification = async ({ railcar, actor, customer }) => {
+  const host = process.env.SMTP_HOST;
+  const port = Number(process.env.SMTP_PORT || 587);
+  const smtpUser = process.env.SMTP_USER;
+  const smtpPass = process.env.SMTP_PASS;
+  const from = process.env.SMTP_FROM || smtpUser;
+
+  if (!host || !from) {
+    return;
+  }
+
+  const recipients = await getReleaseNotificationRecipients();
+  if (recipients.length === 0) {
+    return;
+  }
+
+  let nodemailer;
+  try {
+    nodemailer = require('nodemailer');
+  } catch (err) {
+    console.warn('Railcar placement request email skipped: nodemailer is not installed');
+    return;
+  }
+
+  const transporter = nodemailer.createTransport({
+    host,
+    port,
+    secure: port === 465,
+    auth: smtpUser && smtpPass ? { user: smtpUser, pass: smtpPass } : undefined,
+  });
+
+  const actorName =
+    actor && (actor.firstName || actor.lastName)
+      ? `${actor.firstName || ''} ${actor.lastName || ''}`.trim()
+      : actor?.email || 'Customer User';
+
+  const customerName = customer?.customerName || 'Unknown Customer';
+  const requestedAt = new Date().toLocaleString();
+  const railcarLabel = railcar?.railcarID || `${railcar?.carInitial || ''} ${railcar?.carNumber || ''}`.trim();
+
+  const subject = `Railcar Placement Requested: ${railcarLabel}`;
+  const text = [
+    'A customer requested railcar placement (on-spot).',
+    '',
+    `Railcar: ${railcarLabel}`,
+    `Customer: ${customerName}`,
+    `Current Status: ${railcar?.currentStatus || 'N/A'}`,
+    `Station: ${railcar?.station || 'N/A'}`,
+    `Track: ${railcar?.track || 'N/A'}`,
+    `Requested By: ${actorName}`,
+    `Requested By Email: ${actor?.email || 'N/A'}`,
+    `Requested At: ${requestedAt}`,
+  ].join('\n');
+
+  await transporter.sendMail({
+    from,
+    to: recipients.join(', '),
+    subject,
+    text,
+  });
+};
+
 const parseCsvLine = (line) => {
   const values = [];
   let current = '';
@@ -129,19 +191,39 @@ const toNumberOrNull = (value) => {
   return Number.isFinite(parsed) ? parsed : null;
 };
 
-const ON_SPOT_TRACKS = new Set(['Y-TRACK A', 'Y-TRACK B', 'Y-TRACK C']);
+const ON_SPOT_TRACKS = ['Y-TRACK A', 'Y-TRACK B', 'Y-TRACK C'];
+
+const normalizeTrackToken = (value = '') =>
+  String(value || '')
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '');
 
 const isOnSpotTrack = (track = '') => {
-  const normalized = String(track || '').trim().toUpperCase();
-  return ON_SPOT_TRACKS.has(normalized);
+  const normalized = normalizeTrackToken(track);
+  if (!normalized) return false;
+
+  const canonicalMatch = ON_SPOT_TRACKS.some((name) => normalizeTrackToken(name) === normalized);
+  if (canonicalMatch) return true;
+
+  // Tolerate extract variants like "Y Track A", "Y-TRACK A (TL)", etc.
+  return (
+    normalized.includes('YTRACKA') ||
+    normalized.includes('YTRACKB') ||
+    normalized.includes('YTRACKC') ||
+    normalized.includes('YARDTRANSLOADA') ||
+    normalized.includes('YARDTRANSLOADB') ||
+    normalized.includes('YARDTRANSLOADC')
+  );
 };
 
-const normalizeStatus = (rawStatus = '', hasReleaseDate = false, track = '') => {
+const normalizeStatus = (rawStatus = '', hasReleaseDate = false, track = '', trackId = '') => {
   if (hasReleaseDate) return 'Released';
 
   const value = String(rawStatus || '').toLowerCase().trim();
   if (value.includes('release')) return 'Released';
   if (value === 'on-spot' || value === 'on spot') return 'On-Spot';
+  if (isOnSpotTrack(trackId || track)) return 'On-Spot';
 
   const availableLike =
     value.includes('avail') ||
@@ -318,7 +400,11 @@ const toRowObject = (raw) => {
       row.storagestatus ||
       row.storageind,
     station: row.station || row.Station || row.stationname || row.stationid,
-    track: row.track || row.Track || row.trackname || row.trackid,
+    trackId:
+      row.trackId ||
+      row['Track ID'] ||
+      row.trackid,
+    track: row.track || row.Track || row.trackid || row.trackname,
     trackPosition:
       row.trackPosition ||
       row.trackTrainPosition ||
@@ -366,7 +452,8 @@ const parseCsvRows = (csvText = '') => {
       leStatus: row.lestatus,
       currentStatus: row.currentstatus || row.status || row.storagestatus || row.storageind,
       station: row.station || row.stationname || row.stationid,
-      track: row.track || row.trackname || row.trackid,
+      trackId: row.trackid,
+      track: row.track || row.trackid || row.trackname,
       trackPosition:
         row.tracktrainposition ||
         row.tracktrainpos ||
@@ -430,7 +517,12 @@ const processRailcarIngest = async (inputRows) => {
     }
 
     const hasReleaseDate = Boolean(String(row.releaseDate || '').trim());
-    const normalizedStatus = normalizeStatus(row.currentStatus, hasReleaseDate, row.track);
+    const normalizedStatus = normalizeStatus(
+      row.currentStatus,
+      hasReleaseDate,
+      row.track,
+      row.trackId
+    );
     const update = {
       customerName: customerId,
       carInitial,
@@ -441,7 +533,7 @@ const processRailcarIngest = async (inputRows) => {
       currentStatus: normalizedStatus,
       status: normalizedStatus,
       station: String(row.station || '').trim(),
-      track: String(row.track || '').trim(),
+      track: String(row.trackId || row.track || '').trim(),
       trackPosition: String(row.trackPosition || '').trim(),
       reportedWeight: toNumberOrNull(row.reportedWeight),
       isActive: true,
@@ -715,8 +807,9 @@ router.put('/:id/release-empty', authorizeRoles(['customer', 'internal', 'admin'
       }
     }
 
-    if (railcar.currentStatus !== 'Available') {
-      return res.status(400).json({ message: 'Only Available railcars can be released as empty' });
+    const releasableStatuses = new Set(['Available', 'On-Spot']);
+    if (!releasableStatuses.has(String(railcar.currentStatus || ''))) {
+      return res.status(400).json({ message: 'Only Available or On-Spot railcars can be released as empty' });
     }
 
     railcar.currentStatus = 'Released';
@@ -741,6 +834,49 @@ router.put('/:id/release-empty', authorizeRoles(['customer', 'internal', 'admin'
   } catch (err) {
     console.error('Error releasing railcar as empty:', err);
     res.status(500).json({ message: 'Server error while releasing railcar' });
+  }
+});
+
+router.put('/:id/request-placement', authorizeRoles(['customer', 'internal', 'admin']), async (req, res) => {
+  try {
+    const railcar = await Railcar.findById(req.params.id);
+    if (!railcar) {
+      return res.status(404).json({ message: 'Railcar not found' });
+    }
+
+    if (isCustomerUser(req)) {
+      const tokenCustomerId = customerIdFromToken(req);
+      if (!tokenCustomerId || String(railcar.customerName) !== String(tokenCustomerId)) {
+        return res.status(403).json({ message: 'Access forbidden: railcar is outside customer scope' });
+      }
+    }
+
+    if (railcar.currentStatus === 'On-Spot') {
+      return res.status(400).json({ message: 'Railcar is already on-spot' });
+    }
+
+    if (railcar.currentStatus === 'Released') {
+      return res.status(400).json({ message: 'Released railcars cannot request placement' });
+    }
+
+    railcar.placementRequestedAt = new Date();
+    railcar.placementRequestedBy = req.user?.id || railcar.placementRequestedBy;
+    const saved = await railcar.save();
+
+    try {
+      const [actor, customer] = await Promise.all([
+        User.findById(req.user?.id).select('firstName lastName email'),
+        Customer.findById(saved.customerName).select('customerName'),
+      ]);
+      await sendPlacementRequestNotification({ railcar: saved, actor, customer });
+    } catch (emailErr) {
+      console.error('Railcar placement request email notification failed:', emailErr);
+    }
+
+    res.status(200).json({ message: 'Placement request sent', railcar: saved });
+  } catch (err) {
+    console.error('Error requesting railcar placement:', err);
+    res.status(500).json({ message: 'Server error while requesting railcar placement' });
   }
 });
 

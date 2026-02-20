@@ -32,6 +32,8 @@ const railcarSchema = new mongoose.Schema({
   reportedWeight: { type: Number, title: 'Reported Weight' },
   releasedAsEmptyAt: { type: Date, title: 'Released As Empty At' },
   releasedAsEmptyBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', title: 'Released As Empty By' },
+  placementRequestedAt: { type: Date, title: 'Placement Requested At' },
+  placementRequestedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', title: 'Placement Requested By' },
   isActive: { type: Boolean, default: true, title: 'Is Active' },
 }, {
   timestamps: true,
