@@ -199,34 +199,95 @@ const buildSimpleFallbackPdf = (lines = []) => {
   return Buffer.from(pdf, 'utf8');
 };
 
+const getCandidateChromePaths = (puppeteer) => {
+  const fromEnv = String(process.env.PUPPETEER_EXECUTABLE_PATH || '').trim();
+  const fromPuppeteer = typeof puppeteer.executablePath === 'function' ? String(puppeteer.executablePath() || '').trim() : '';
+
+  const candidates = [
+    fromEnv,
+    fromPuppeteer,
+    '/opt/render/project/src/node_modules/puppeteer/.local-chromium/linux-*/chrome-linux/chrome',
+    '/usr/bin/google-chrome',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium',
+  ].filter(Boolean);
+
+  // Keep only concrete paths where possible; keep env/pup path even if missing so we can log it.
+  return [...new Set(candidates)];
+};
+
+const pathExists = (value) => {
+  try {
+    return fs.existsSync(value);
+  } catch (_err) {
+    return false;
+  }
+};
+
 const renderPdfFromHtml = async (html) => {
   const puppeteer = require('puppeteer');
-  const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
-  const browser = await puppeteer.launch({
-    headless: 'new',
-    executablePath,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--font-render-hinting=none',
-    ],
-  });
+  const launchArgs = [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    '--font-render-hinting=none',
+  ];
 
-  try {
-    const page = await browser.newPage();
-    await page.setContent(html, { waitUntil: 'networkidle0' });
-    await page.emulateMediaType('print');
-    const pdf = await page.pdf({
-      format: 'Letter',
-      printBackground: true,
-      preferCSSPageSize: true,
-      margin: { top: '0.35in', right: '0.35in', bottom: '0.35in', left: '0.35in' },
-    });
-    return Buffer.isBuffer(pdf) ? pdf : Buffer.from(pdf);
-  } finally {
-    await browser.close();
+  const candidatePaths = getCandidateChromePaths(puppeteer);
+  const launchAttempts = [];
+
+  // First try explicit executable paths that exist (or were explicitly provided).
+  candidatePaths.forEach((candidate) => {
+    const fromEnv = String(process.env.PUPPETEER_EXECUTABLE_PATH || '').trim();
+    if (candidate === fromEnv || pathExists(candidate)) {
+      launchAttempts.push({ label: `executablePath=${candidate}`, options: { executablePath: candidate } });
+    }
+  });
+  // Fallback to default Puppeteer resolution.
+  launchAttempts.push({ label: 'default puppeteer executable resolution', options: {} });
+
+  let lastErr = null;
+
+  for (const attempt of launchAttempts) {
+    let browser;
+    try {
+      browser = await puppeteer.launch({
+        headless: 'new',
+        args: launchArgs,
+        ...attempt.options,
+      });
+
+      const page = await browser.newPage();
+      await page.setContent(html, { waitUntil: 'networkidle0' });
+      await page.emulateMediaType('print');
+      const pdf = await page.pdf({
+        format: 'Letter',
+        printBackground: true,
+        preferCSSPageSize: true,
+        margin: { top: '0.35in', right: '0.35in', bottom: '0.35in', left: '0.35in' },
+      });
+      return Buffer.isBuffer(pdf) ? pdf : Buffer.from(pdf);
+    } catch (err) {
+      lastErr = err;
+      console.error(
+        `Puppeteer launch attempt failed (${attempt.label}):`,
+        err?.message || err
+      );
+    } finally {
+      if (browser) {
+        await browser.close().catch(() => {});
+      }
+    }
   }
+
+  const debugContext = {
+    PUPPETEER_EXECUTABLE_PATH: process.env.PUPPETEER_EXECUTABLE_PATH || '',
+    PUPPETEER_CACHE_DIR: process.env.PUPPETEER_CACHE_DIR || '',
+    HOME: process.env.HOME || '',
+    candidatePaths,
+  };
+  console.error('Puppeteer debug context:', JSON.stringify(debugContext));
+  throw lastErr || new Error('Failed to launch Puppeteer');
 };
 
 const buildBolPdfAttachment = async ({ bol, order, customer, receiver, project, material, shipper }) => {
@@ -266,3 +327,4 @@ module.exports = {
   buildBolPdfAttachment,
   buildBolPrintHtml,
 };
+const fs = require('fs');
