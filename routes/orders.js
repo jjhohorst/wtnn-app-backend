@@ -48,12 +48,11 @@ const validatePreferredRailcars = async ({ customerId, railcarID, splitLoad, sec
     const railcar = await Railcar.findOne({
       customerName: customerId,
       railcarID: requestedRailcar,
-      status: 'Available',
       isActive: { $ne: false },
     });
 
     if (!railcar) {
-      return `Selected railcar "${requestedRailcar}" is not available for this customer`;
+      return `Selected railcar "${requestedRailcar}" was not found for this customer`;
     }
   }
 
