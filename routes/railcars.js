@@ -191,7 +191,7 @@ const toNumberOrNull = (value) => {
   return Number.isFinite(parsed) ? parsed : null;
 };
 
-const ON_SPOT_TRACKS = ['Y-TRACK A', 'Y-TRACK B', 'Y-TRACK C'];
+const ON_SPOT_TRACKS = ['Y-TRACK A', 'Y-TRACK B', 'Y-TRACK C', 'Y-TRACK D'];
 
 const normalizeTrackToken = (value = '') =>
   String(value || '')
@@ -211,9 +211,11 @@ const isOnSpotTrack = (track = '') => {
     normalized.includes('YTRACKA') ||
     normalized.includes('YTRACKB') ||
     normalized.includes('YTRACKC') ||
+    normalized.includes('YTRACKD') ||
     normalized.includes('YARDTRANSLOADA') ||
     normalized.includes('YARDTRANSLOADB') ||
-    normalized.includes('YARDTRANSLOADC')
+    normalized.includes('YARDTRANSLOADC') ||
+    normalized.includes('YARDTRANSLOADD')
   );
 };
 
