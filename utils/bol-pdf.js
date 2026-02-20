@@ -201,17 +201,26 @@ const buildSimpleFallbackPdf = (lines = []) => {
 
 const renderPdfFromHtml = async (html) => {
   const puppeteer = require('puppeteer');
+  const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
   const browser = await puppeteer.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    headless: 'new',
+    executablePath,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--font-render-hinting=none',
+    ],
   });
 
   try {
     const page = await browser.newPage();
     await page.setContent(html, { waitUntil: 'networkidle0' });
+    await page.emulateMediaType('print');
     const pdf = await page.pdf({
       format: 'Letter',
       printBackground: true,
+      preferCSSPageSize: true,
       margin: { top: '0.35in', right: '0.35in', bottom: '0.35in', left: '0.35in' },
     });
     return Buffer.isBuffer(pdf) ? pdf : Buffer.from(pdf);
