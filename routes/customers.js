@@ -13,6 +13,27 @@ const {
 
 const isSameCustomer = (a, b) => String(a) === String(b);
 const normalizeCustomerCode = (value) => String(value || '').trim().toUpperCase();
+const DEFAULT_LOAD_GOAL_MINUTES = 90;
+const MAX_LOAD_GOAL_MINUTES = 180;
+const parseLoadGoalMinutesInput = (value) => {
+  if (value === undefined) return { provided: false };
+  if (value === null || String(value).trim() === '') return { provided: true, shouldUnset: true };
+
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return { provided: true, error: 'Average load goal must be a number of minutes' };
+  }
+
+  const rounded = Math.round(parsed);
+  if (rounded < 1 || rounded > MAX_LOAD_GOAL_MINUTES) {
+    return {
+      provided: true,
+      error: `Average load goal must be between 1 and ${MAX_LOAD_GOAL_MINUTES} minutes`,
+    };
+  }
+
+  return { provided: true, value: rounded };
+};
 
 router.use(requireAuth);
 
@@ -29,6 +50,10 @@ router.post(
     body('customerCity').notEmpty().withMessage('Customer City is required'),
     body('customerState').notEmpty().withMessage('Customer State is required'),
     body('customerZip').notEmpty().withMessage('Customer ZIP is required'),
+    body('loadGoalMinutes')
+      .optional({ nullable: true, checkFalsy: false })
+      .isFloat({ min: 1, max: MAX_LOAD_GOAL_MINUTES })
+      .withMessage(`Average load goal must be between 1 and ${MAX_LOAD_GOAL_MINUTES} minutes`),
   ],
   async (req, res) => {
     const errors = validationResult(req);
@@ -44,6 +69,21 @@ router.post(
       } else {
         delete payload.customerCode;
       }
+
+      const parsedLoadGoal = parseLoadGoalMinutesInput(payload.loadGoalMinutes);
+      if (parsedLoadGoal.error) {
+        return res.status(400).json({ message: parsedLoadGoal.error });
+      }
+      if (parsedLoadGoal.provided) {
+        if (parsedLoadGoal.shouldUnset) {
+          delete payload.loadGoalMinutes;
+        } else {
+          payload.loadGoalMinutes = parsedLoadGoal.value;
+        }
+      } else {
+        payload.loadGoalMinutes = DEFAULT_LOAD_GOAL_MINUTES;
+      }
+
       const newCustomer = new Customer(payload);
       const savedCustomer = await newCustomer.save();
       res.status(201).json({ message: 'Customer created successfully', customer: savedCustomer });
@@ -139,6 +179,19 @@ router.put('/:id', authorizeRoles(['internal', 'admin']), async (req, res) => {
       } else {
         delete setPayload.customerCode;
         unsetPayload.customerCode = 1;
+      }
+    }
+
+    const parsedLoadGoal = parseLoadGoalMinutesInput(payload.loadGoalMinutes);
+    if (parsedLoadGoal.error) {
+      return res.status(400).json({ message: parsedLoadGoal.error });
+    }
+    if (parsedLoadGoal.provided) {
+      if (parsedLoadGoal.shouldUnset) {
+        delete setPayload.loadGoalMinutes;
+        unsetPayload.loadGoalMinutes = 1;
+      } else {
+        setPayload.loadGoalMinutes = parsedLoadGoal.value;
       }
     }
 

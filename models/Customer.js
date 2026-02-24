@@ -10,7 +10,14 @@ const customerSchema = new mongoose.Schema({
   customerCity: { type: String, required: true , title: 'Company City'},
   customerState: { type: String, required: true , title: 'Company State'},
   customerZip: { type: String, required: true , title: 'Company ZIP'},
-  customerLogo: { type: String, default: '' }
+  customerLogo: { type: String, default: '' },
+  loadGoalMinutes: {
+    type: Number,
+    default: 90,
+    min: 1,
+    max: 180,
+    title: 'Average Load Goal (minutes)',
+  },
 
 });
 
