@@ -761,8 +761,8 @@ router.delete('/:id', authorizeRoles(['internal', 'admin']), async (req, res) =>
       return res.status(404).json({ message: 'BOL not found' });
     }
 
-    if (existingBOL.status === 'Completed') {
-      return res.status(400).json({ message: 'Completed BOLs are locked and cannot be deleted' });
+    if (existingBOL.status !== 'Draft') {
+      return res.status(400).json({ message: 'Only Draft BOLs can be deleted' });
     }
 
     await BOL.findByIdAndDelete(req.params.id);
