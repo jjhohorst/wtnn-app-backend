@@ -22,6 +22,22 @@ const orderSchema = new mongoose.Schema({
   materialName: { type: mongoose.Schema.Types.ObjectId,
 				 ref: 'Material',
 				 required: true },
+  inventorySource: {
+    type: String,
+    enum: ['railcar', 'ground'],
+    default: 'railcar',
+    title: 'Inventory Source',
+  },
+  groundInventoryLot: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'GroundInventoryLot',
+    title: 'Ground Inventory Lot',
+  },
+  secondaryGroundInventoryLot: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'GroundInventoryLot',
+    title: 'Secondary Ground Inventory Lot',
+  },
   railcarID: { type: String, default: '', title: 'Preferred Railcar #' },
   splitLoad: { type: Boolean, default: false, title: 'Split Load' },
   secondaryRailcarID: { type: String, default: '', title: 'Secondary Preferred Railcar #' },

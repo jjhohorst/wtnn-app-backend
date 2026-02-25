@@ -18,6 +18,11 @@ const customerSchema = new mongoose.Schema({
     max: 180,
     title: 'Average Load Goal (minutes)',
   },
+  enableGroundInventory: {
+    type: Boolean,
+    default: false,
+    title: 'Enable Ground Inventory',
+  },
 
 });
 

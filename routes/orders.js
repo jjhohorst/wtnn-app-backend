@@ -6,6 +6,7 @@ const Order = require('../models/Order');
 const Project = require('../models/Project');
 const Receiver = require('../models/Receiver');
 const Railcar = require('../models/Railcar');
+const GroundInventoryLot = require('../models/GroundInventoryLot');
 const {
   requireAuth,
   authorizeRoles,
@@ -31,7 +32,67 @@ const normalizeSplitLoadPayload = (payload = {}) => {
   return normalized;
 };
 
-const validatePreferredRailcars = async ({ customerId, railcarID, splitLoad, secondaryRailcarID }) => {
+const validatePreferredRailcars = async ({
+  customerId,
+  inventorySource,
+  railcarID,
+  splitLoad,
+  secondaryRailcarID,
+  materialName,
+  groundInventoryLot,
+  secondaryGroundInventoryLot,
+}) => {
+  if (inventorySource === 'ground') {
+    if (!materialName || !isValidObjectId(materialName)) {
+      return 'Material is required when inventory source is Ground';
+    }
+
+    if (groundInventoryLot) {
+      if (!isValidObjectId(groundInventoryLot)) {
+        return 'Selected ground inventory lot is invalid';
+      }
+
+      const lot = await GroundInventoryLot.findById(groundInventoryLot).select('customerName materialName remainingWeight status');
+      if (!lot) return 'Selected ground inventory lot was not found';
+      if (String(lot.customerName || '') !== String(customerId)) {
+        return 'Selected ground inventory lot does not belong to this customer';
+      }
+      if (String(lot.materialName || '') !== String(materialName)) {
+        return 'Selected ground inventory lot does not match the selected material';
+      }
+      if (lot.status === 'archived' || Number(lot.remainingWeight || 0) <= 0) {
+        return 'Selected ground inventory lot is not available';
+      }
+    }
+
+    if (splitLoad) {
+      if (!secondaryGroundInventoryLot) {
+        return 'Secondary ground inventory lot is required when split load is enabled';
+      }
+      if (!isValidObjectId(secondaryGroundInventoryLot)) {
+        return 'Secondary ground inventory lot is invalid';
+      }
+
+      if (String(groundInventoryLot || '') && String(secondaryGroundInventoryLot) === String(groundInventoryLot)) {
+        return 'Primary and secondary ground inventory lots must be different';
+      }
+
+      const secondaryLot = await GroundInventoryLot.findById(secondaryGroundInventoryLot).select('customerName materialName remainingWeight status');
+      if (!secondaryLot) return 'Secondary ground inventory lot was not found';
+      if (String(secondaryLot.customerName || '') !== String(customerId)) {
+        return 'Secondary ground inventory lot does not belong to this customer';
+      }
+      if (String(secondaryLot.materialName || '') !== String(materialName)) {
+        return 'Secondary ground inventory lot does not match the selected material';
+      }
+      if (secondaryLot.status === 'archived' || Number(secondaryLot.remainingWeight || 0) <= 0) {
+        return 'Secondary ground inventory lot is not available';
+      }
+    }
+
+    return null;
+  }
+
   const primary = String(railcarID || '').trim();
   const secondary = String(secondaryRailcarID || '').trim();
 
@@ -74,6 +135,18 @@ router.post(
     body('pickUpDate').notEmpty().isISO8601().withMessage('Pick up date must be a valid date'),
     body('deliveryDate').notEmpty().isISO8601().withMessage('Delivery date must be a valid date'),
     body('createdBy').notEmpty().isMongoId().withMessage('Created by must be a valid user ID'),
+    body('inventorySource')
+      .optional()
+      .isIn(['railcar', 'ground'])
+      .withMessage('Inventory source must be railcar or ground'),
+    body('groundInventoryLot')
+      .optional({ checkFalsy: true })
+      .isMongoId()
+      .withMessage('Ground inventory lot must be a valid id'),
+    body('secondaryGroundInventoryLot')
+      .optional({ checkFalsy: true })
+      .isMongoId()
+      .withMessage('Secondary ground inventory lot must be a valid id'),
   ],
   async (req, res) => {
     const errors = validationResult(req);
@@ -101,12 +174,24 @@ router.post(
       req.body.splitLoad = normalizedPayload.splitLoad;
       req.body.railcarID = normalizedPayload.railcarID;
       req.body.secondaryRailcarID = normalizedPayload.secondaryRailcarID;
+      req.body.inventorySource = req.body.inventorySource === 'ground' ? 'ground' : 'railcar';
+
+      if (req.body.inventorySource === 'ground') {
+        req.body.railcarID = '';
+        req.body.secondaryRailcarID = '';
+      } else {
+        req.body.secondaryGroundInventoryLot = null;
+      }
 
       const railcarValidationError = await validatePreferredRailcars({
         customerId: req.body.customerName,
+        inventorySource: req.body.inventorySource,
         railcarID: req.body.railcarID,
         splitLoad: req.body.splitLoad,
         secondaryRailcarID: req.body.secondaryRailcarID,
+        materialName: req.body.materialName,
+        groundInventoryLot: req.body.groundInventoryLot,
+        secondaryGroundInventoryLot: req.body.secondaryGroundInventoryLot,
       });
       if (railcarValidationError) {
         return res.status(400).json({ message: railcarValidationError });
@@ -179,6 +264,8 @@ router.get('/', authorizeRoles(['customer', 'internal', 'admin']), async (req, r
       .populate('projectName', 'projectName fullAddress')
       .populate('receiverName', 'receiverName')
       .populate('materialName', 'materialName refNum truckType')
+      .populate('groundInventoryLot', 'remainingWeight startingWeight status sourceType sourceRailcarID sourceRailShipmentBolNumber')
+      .populate('secondaryGroundInventoryLot', 'remainingWeight startingWeight status sourceType sourceRailcarID sourceRailShipmentBolNumber')
       .populate('createdBy', 'firstName lastName fullName');
 
     res.status(200).json(orders);
@@ -196,6 +283,8 @@ router.get('/:id', authorizeRoles(['customer', 'internal', 'admin']), async (req
       .populate('projectName', 'projectName fullAddress')
       .populate('receiverName', 'receiverName')
       .populate('materialName', 'materialName refNum truckType')
+      .populate('groundInventoryLot', 'remainingWeight startingWeight status sourceType sourceRailcarID sourceRailShipmentBolNumber')
+      .populate('secondaryGroundInventoryLot', 'remainingWeight startingWeight status sourceType sourceRailcarID sourceRailShipmentBolNumber')
       .populate('createdBy', 'firstName lastName fullName');
 
     if (!order) {
@@ -257,6 +346,8 @@ router.put('/:id', authorizeRoles(['customer', 'internal', 'admin']), async (req
             'notes',
             'createdBy',
             'customerName',
+            'groundInventoryLot',
+            'secondaryGroundInventoryLot',
           ];
           editableFields.forEach((field) => delete payload[field]);
         }
@@ -274,25 +365,48 @@ router.put('/:id', authorizeRoles(['customer', 'internal', 'admin']), async (req
       delete payload.createdBy;
     }
 
-    const hasRailcarSelectionChange =
+      const hasRailcarSelectionChange =
       Object.prototype.hasOwnProperty.call(payload, 'customerName') ||
+      Object.prototype.hasOwnProperty.call(payload, 'inventorySource') ||
       Object.prototype.hasOwnProperty.call(payload, 'railcarID') ||
       Object.prototype.hasOwnProperty.call(payload, 'splitLoad') ||
-      Object.prototype.hasOwnProperty.call(payload, 'secondaryRailcarID');
+      Object.prototype.hasOwnProperty.call(payload, 'secondaryRailcarID') ||
+      Object.prototype.hasOwnProperty.call(payload, 'materialName') ||
+      Object.prototype.hasOwnProperty.call(payload, 'groundInventoryLot') ||
+      Object.prototype.hasOwnProperty.call(payload, 'secondaryGroundInventoryLot');
 
     if (hasRailcarSelectionChange) {
       const effectiveCustomerId = payload.customerName || existingOrder.customerName;
+      const effectiveInventorySource = payload.inventorySource || existingOrder.inventorySource || 'railcar';
       const effectiveRailcarID = payload.railcarID !== undefined ? payload.railcarID : existingOrder.railcarID;
       const effectiveSplitLoad = payload.splitLoad !== undefined ? payload.splitLoad : Boolean(existingOrder.splitLoad);
       const effectiveSecondaryRailcarID = payload.secondaryRailcarID !== undefined
         ? payload.secondaryRailcarID
         : existingOrder.secondaryRailcarID;
+      const effectiveMaterialName = payload.materialName || existingOrder.materialName;
+      const effectiveGroundLot = payload.groundInventoryLot !== undefined
+        ? payload.groundInventoryLot
+        : existingOrder.groundInventoryLot;
+      const effectiveSecondaryGroundLot = payload.secondaryGroundInventoryLot !== undefined
+        ? payload.secondaryGroundInventoryLot
+        : existingOrder.secondaryGroundInventoryLot;
+
+      if (effectiveInventorySource === 'ground') {
+        payload.railcarID = '';
+        payload.secondaryRailcarID = '';
+      } else {
+        payload.secondaryGroundInventoryLot = null;
+      }
 
       const railcarValidationError = await validatePreferredRailcars({
         customerId: effectiveCustomerId,
+        inventorySource: effectiveInventorySource,
         railcarID: effectiveRailcarID,
         splitLoad: effectiveSplitLoad,
         secondaryRailcarID: effectiveSecondaryRailcarID,
+        materialName: effectiveMaterialName,
+        groundInventoryLot: effectiveGroundLot,
+        secondaryGroundInventoryLot: effectiveSecondaryGroundLot,
       });
       if (railcarValidationError) {
         return res.status(400).json({ message: railcarValidationError });

@@ -5,7 +5,10 @@ const router = express.Router();
 const BOL = require('../models/BOL');
 const Order = require('../models/Order');
 const Railcar = require('../models/Railcar');
+const Customer = require('../models/Customer');
 const User = require('../models/User');
+const GroundInventoryLot = require('../models/GroundInventoryLot');
+const GroundInventoryAllocation = require('../models/GroundInventoryAllocation');
 const { sendAppEmail } = require('../utils/email');
 const { buildBolPdfAttachment } = require('../utils/bol-pdf');
 const {
@@ -17,6 +20,12 @@ const {
 
 const isSameCustomer = (a, b) => String(a) === String(b);
 const trimToString = (value) => String(value || '').trim();
+const normalizeInventorySource = (value) => (String(value || '').trim().toLowerCase() === 'ground' ? 'ground' : 'railcar');
+const toNumberOrNull = (value) => {
+  if (value == null || value === '') return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
 
 const parseMonthWindow = (yearValue, monthValue) => {
   const now = new Date();
@@ -64,10 +73,28 @@ const baseCreateValidation = [
   body('projectName').notEmpty().isMongoId().withMessage('Project name is required and must be a valid ID'),
   body('materialName').notEmpty().isMongoId().withMessage('Material name is required and must be a valid ID'),
   body('bolDate').notEmpty().isISO8601().withMessage('BOL date is required and must be valid'),
-  body('railcarID').notEmpty().withMessage('Railcar ID is required'),
+  body('railcarID')
+    .custom((value, { req }) => {
+      const source = normalizeInventorySource(req.body.inventorySource);
+      if (source === 'ground') return true;
+      return Boolean(String(value || '').trim());
+    })
+    .withMessage('Railcar ID is required for railcar inventory source'),
   body('truckID').notEmpty().withMessage('Truck ID is required'),
   body('trailerID').notEmpty().withMessage('Trailer ID is required'),
   body('createdBy').notEmpty().isMongoId().withMessage('Created by is required and must be a valid user ID'),
+  body('inventorySource')
+    .optional()
+    .isIn(['railcar', 'ground'])
+    .withMessage('Inventory source must be railcar or ground'),
+  body('groundInventoryLot')
+    .optional({ checkFalsy: true })
+    .isMongoId()
+    .withMessage('Ground inventory lot must be a valid ID'),
+  body('secondaryGroundInventoryLot')
+    .optional({ checkFalsy: true })
+    .isMongoId()
+    .withMessage('Secondary ground inventory lot must be a valid ID'),
 ];
 
 const completionValidation = [
@@ -94,6 +121,65 @@ const completionValidation = [
 
 router.use(requireAuth);
 
+const ensureGroundInventoryLotIsUsable = async ({ lotId, customerId, materialId }) => {
+  if (!lotId) return { ok: false, message: 'Ground inventory lot is required for ground-source BOLs' };
+  if (!isValidObjectId(lotId)) return { ok: false, message: 'Ground inventory lot is invalid' };
+
+  const lot = await GroundInventoryLot.findById(lotId).select('customerName materialName remainingWeight status');
+  if (!lot) return { ok: false, message: 'Ground inventory lot not found' };
+  if (String(lot.customerName || '') !== String(customerId || '')) {
+    return { ok: false, message: 'Ground inventory lot does not belong to this customer' };
+  }
+  if (String(lot.materialName || '') !== String(materialId || '')) {
+    return { ok: false, message: 'Ground inventory lot does not match this material' };
+  }
+  if (lot.status === 'archived' || Number(lot.remainingWeight || 0) <= 0) {
+    return { ok: false, message: 'Ground inventory lot is not available' };
+  }
+  return { ok: true, lot };
+};
+
+const consumeGroundInventoryLot = async ({ lotId, customerId, materialId, weight }) => {
+  const consumeWeight = Number(weight || 0);
+  if (!Number.isFinite(consumeWeight) || consumeWeight < 0) {
+    return { ok: false, message: 'Invalid ground inventory consume weight' };
+  }
+  if (consumeWeight === 0) {
+    const lot = await GroundInventoryLot.findOne({
+      _id: lotId,
+      customerName: customerId,
+      materialName: materialId,
+      status: { $in: ['available', 'depleted'] },
+    });
+    if (!lot) return { ok: false, message: 'Ground inventory lot not found while completing BOL' };
+    return { ok: true, lot, consumedWeight: 0 };
+  }
+
+  const lot = await GroundInventoryLot.findOneAndUpdate(
+    {
+      _id: lotId,
+      customerName: customerId,
+      materialName: materialId,
+      status: { $in: ['available', 'depleted'] },
+      remainingWeight: { $gte: consumeWeight },
+    },
+    {
+      $inc: { remainingWeight: -consumeWeight },
+      $set: { status: 'available' },
+    },
+    { new: true }
+  );
+
+  if (!lot) return { ok: false, message: 'Ground inventory lot does not have enough remaining weight to complete this BOL' };
+
+  if (Number(lot.remainingWeight || 0) <= 0 && lot.status !== 'depleted') {
+    lot.status = 'depleted';
+    await lot.save();
+  }
+
+  return { ok: true, lot, consumedWeight: consumeWeight };
+};
+
 router.post('/', authorizeRoles(['internal', 'admin']), baseCreateValidation, async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
@@ -101,6 +187,7 @@ router.post('/', authorizeRoles(['internal', 'admin']), baseCreateValidation, as
   }
 
   const bolData = { ...req.body };
+  bolData.inventorySource = normalizeInventorySource(bolData.inventorySource);
 
   const requestedStatus = bolData.status || 'Draft';
   if (!['Draft', 'Completed'].includes(requestedStatus)) {
@@ -123,15 +210,88 @@ router.post('/', authorizeRoles(['internal', 'admin']), baseCreateValidation, as
       if (!Number.isFinite(draftTare)) {
         return res.status(400).json({ message: 'Draft tare weight must be numeric' });
       }
+      if (draftTare < 0) {
+        return res.status(400).json({ message: 'Draft tare weight cannot be negative' });
+      }
       bolData.tareWeight = draftTare;
     } else {
       bolData.tareWeight = null;
     }
   }
 
+  const createGrossWeight = toNumberOrNull(bolData.grossWeight);
+  const createTareWeight = toNumberOrNull(bolData.tareWeight);
+  const createSecondaryGrossWeight = toNumberOrNull(bolData.secondaryGrossWeight);
+  const createSecondaryTareWeight = toNumberOrNull(bolData.secondaryTareWeight);
+
+  if (createGrossWeight != null && createGrossWeight < 0) {
+    return res.status(400).json({ message: 'Primary gross weight cannot be negative' });
+  }
+  if (createTareWeight != null && createTareWeight < 0) {
+    return res.status(400).json({ message: 'Primary tare weight cannot be negative' });
+  }
+  if (createGrossWeight != null && createTareWeight != null && createGrossWeight < createTareWeight) {
+    return res.status(400).json({ message: 'Primary gross weight must be greater than or equal to primary tare weight' });
+  }
+  if (createSecondaryGrossWeight != null && createSecondaryGrossWeight < 0) {
+    return res.status(400).json({ message: 'Secondary gross weight cannot be negative' });
+  }
+  if (createSecondaryTareWeight != null && createSecondaryTareWeight < 0) {
+    return res.status(400).json({ message: 'Secondary tare weight cannot be negative' });
+  }
+  if (
+    createSecondaryGrossWeight != null
+    && createSecondaryTareWeight != null
+    && createSecondaryGrossWeight < createSecondaryTareWeight
+  ) {
+    return res.status(400).json({ message: 'Secondary gross weight must be greater than or equal to secondary tare weight' });
+  }
+
   try {
-    bolData.railcarID = trimToString(bolData.railcarID);
+    bolData.railcarID = bolData.inventorySource === 'ground' ? '' : trimToString(bolData.railcarID);
     bolData.railShipmentBolNumber = trimToString(bolData.railShipmentBolNumber);
+    bolData.groundInventoryLot = bolData.groundInventoryLot || null;
+    bolData.secondaryGroundInventoryLot = bolData.secondaryGroundInventoryLot || null;
+
+    if (bolData.inventorySource === 'ground') {
+      bolData.secondaryRailcarID = '';
+      bolData.secondaryGrossWeight = null;
+      bolData.secondaryTareWeight = null;
+      bolData.secondaryNetWeight = null;
+      bolData.secondaryTonWeight = null;
+      bolData.railShipmentBolNumber = '';
+      bolData.secondaryRailShipmentBolNumber = '';
+
+      const lotCheck = await ensureGroundInventoryLotIsUsable({
+        lotId: bolData.groundInventoryLot,
+        customerId: bolData.customerName,
+        materialId: bolData.materialName,
+      });
+      if (!lotCheck.ok) {
+        return res.status(400).json({ message: lotCheck.message });
+      }
+
+      if (bolData.splitLoad) {
+        if (!bolData.secondaryGroundInventoryLot) {
+          return res.status(400).json({ message: 'Secondary ground inventory lot is required for split ground loads' });
+        }
+        if (String(bolData.secondaryGroundInventoryLot) === String(bolData.groundInventoryLot)) {
+          return res.status(400).json({ message: 'Primary and secondary ground inventory lots must be different' });
+        }
+        const secondaryLotCheck = await ensureGroundInventoryLotIsUsable({
+          lotId: bolData.secondaryGroundInventoryLot,
+          customerId: bolData.customerName,
+          materialId: bolData.materialName,
+        });
+        if (!secondaryLotCheck.ok) {
+          return res.status(400).json({ message: secondaryLotCheck.message });
+        }
+      } else {
+        bolData.secondaryGroundInventoryLot = null;
+      }
+    } else {
+      bolData.secondaryGroundInventoryLot = null;
+    }
 
     if (!bolData.railShipmentBolNumber && bolData.customerName && bolData.railcarID) {
       bolData.railShipmentBolNumber = await findActiveRailcarShipmentBol({
@@ -420,6 +580,8 @@ router.get('/', authorizeRoles(['customer', 'internal', 'admin']), async (req, r
         ],
       })
       .populate('customerName', 'customerName customerCode customerLogo customerAddress1 customerAddress2 customerCity customerState customerZip')
+      .populate('groundInventoryLot', 'startingWeight remainingWeight status sourceType sourceRailcarID sourceRailShipmentBolNumber')
+      .populate('secondaryGroundInventoryLot', 'startingWeight remainingWeight status sourceType sourceRailcarID sourceRailShipmentBolNumber')
       .populate('createdBy', 'firstName lastName fullName')
       .populate('completedBy', 'firstName lastName fullName');
 
@@ -444,6 +606,8 @@ router.get('/:id', authorizeRoles(['customer', 'internal', 'admin']), async (req
         ],
       })
       .populate('customerName', 'customerName customerCode customerLogo customerAddress1 customerAddress2 customerCity customerState customerZip')
+      .populate('groundInventoryLot', 'startingWeight remainingWeight status sourceType sourceRailcarID sourceRailShipmentBolNumber')
+      .populate('secondaryGroundInventoryLot', 'startingWeight remainingWeight status sourceType sourceRailcarID sourceRailShipmentBolNumber')
       .populate('createdBy', 'firstName lastName fullName')
       .populate('completedBy', 'firstName lastName fullName');
 
@@ -506,7 +670,38 @@ router.put('/:id/complete', authorizeRoles(['internal', 'admin']), completionVal
     }
 
     const splitLoad = req.body.splitLoad === true || req.body.splitLoad === 'true';
-    if (splitLoad) {
+    const inventorySource = normalizeInventorySource(req.body.inventorySource || bol.inventorySource);
+    const groundInventoryLotId = req.body.groundInventoryLot || bol.groundInventoryLot;
+    const secondaryGroundInventoryLotId = req.body.secondaryGroundInventoryLot || bol.secondaryGroundInventoryLot;
+    if (inventorySource === 'ground') {
+      const lotCheck = await ensureGroundInventoryLotIsUsable({
+        lotId: groundInventoryLotId,
+        customerId: bol.customerName,
+        materialId: bol.materialName,
+      });
+      if (!lotCheck.ok) {
+        return res.status(400).json({ message: lotCheck.message });
+      }
+
+      if (splitLoad) {
+        if (!secondaryGroundInventoryLotId) {
+          return res.status(400).json({ message: 'Secondary ground inventory lot is required for split ground loads' });
+        }
+        if (String(secondaryGroundInventoryLotId) === String(groundInventoryLotId)) {
+          return res.status(400).json({ message: 'Primary and secondary ground inventory lots must be different' });
+        }
+        const secondaryLotCheck = await ensureGroundInventoryLotIsUsable({
+          lotId: secondaryGroundInventoryLotId,
+          customerId: bol.customerName,
+          materialId: bol.materialName,
+        });
+        if (!secondaryLotCheck.ok) {
+          return res.status(400).json({ message: secondaryLotCheck.message });
+        }
+      }
+    }
+
+    if (inventorySource !== 'ground' && splitLoad) {
       const secondaryRailcarID = String(req.body.secondaryRailcarID || '').trim();
       if (!secondaryRailcarID) {
         return res.status(400).json({ message: 'Secondary railcar ID is required for split loads' });
@@ -519,10 +714,22 @@ router.put('/:id/complete', authorizeRoles(['internal', 'admin']), completionVal
       }
     }
 
+    if (inventorySource === 'ground' && splitLoad) {
+      if (req.body.secondaryGrossWeight == null || req.body.secondaryGrossWeight === '') {
+        return res.status(400).json({ message: 'Secondary gross weight is required for split loads' });
+      }
+    }
+
     const primaryGrossWeight = Number(req.body.grossWeight);
     const primaryTareWeight = Number(req.body.tareWeight);
     if (!Number.isFinite(primaryGrossWeight) || !Number.isFinite(primaryTareWeight)) {
       return res.status(400).json({ message: 'Primary gross/tare weights must be valid numbers' });
+    }
+    if (primaryGrossWeight < 0 || primaryTareWeight < 0) {
+      return res.status(400).json({ message: 'Primary gross/tare weights cannot be negative' });
+    }
+    if (primaryGrossWeight < primaryTareWeight) {
+      return res.status(400).json({ message: 'Primary gross weight must be greater than or equal to primary tare weight' });
     }
 
     const weighInTime = new Date(req.body.weighInTime);
@@ -539,14 +746,24 @@ router.put('/:id/complete', authorizeRoles(['internal', 'admin']), completionVal
       if (!Number.isFinite(secondaryGrossWeight)) {
         return res.status(400).json({ message: 'Secondary gross weight must be a valid number for split loads' });
       }
+      if (secondaryGrossWeight < 0 || secondaryTareWeight < 0) {
+        return res.status(400).json({ message: 'Secondary gross/tare weights cannot be negative for split loads' });
+      }
+      if (secondaryGrossWeight < secondaryTareWeight) {
+        return res.status(400).json({ message: 'Secondary gross weight must be greater than or equal to secondary tare weight for split loads' });
+      }
     }
 
     bol.grossWeight = primaryGrossWeight;
     bol.tareWeight = primaryTareWeight;
+    bol.inventorySource = inventorySource;
+    bol.groundInventoryLot = inventorySource === 'ground' ? groundInventoryLotId : null;
+    bol.secondaryGroundInventoryLot = inventorySource === 'ground' && splitLoad ? secondaryGroundInventoryLotId : null;
     bol.splitLoad = splitLoad;
-    bol.secondaryRailcarID = splitLoad ? String(req.body.secondaryRailcarID || '').trim() : '';
-    bol.secondaryGrossWeight = secondaryGrossWeight;
-    bol.secondaryTareWeight = secondaryTareWeight;
+    bol.railcarID = inventorySource === 'ground' ? '' : trimToString(bol.railcarID);
+    bol.secondaryRailcarID = inventorySource === 'ground' ? '' : splitLoad ? String(req.body.secondaryRailcarID || '').trim() : '';
+    bol.secondaryGrossWeight = splitLoad ? secondaryGrossWeight : null;
+    bol.secondaryTareWeight = splitLoad ? secondaryTareWeight : null;
     bol.secondaryNetWeight = null;
     bol.secondaryTonWeight = null;
     bol.weighInTime = weighInTime;
@@ -556,14 +773,16 @@ router.put('/:id/complete', authorizeRoles(['internal', 'admin']), completionVal
     bol.signedAt = req.body.signedAt ? new Date(req.body.signedAt) : new Date();
     bol.comments = req.body.comments ?? bol.comments;
 
-    if (bol.customerName && bol.railcarID) {
+    if (inventorySource === 'railcar' && bol.customerName && bol.railcarID) {
       bol.railShipmentBolNumber = await findActiveRailcarShipmentBol({
         customerId: bol.customerName,
         railcarID: bol.railcarID,
       });
+    } else {
+      bol.railShipmentBolNumber = '';
     }
 
-    if (splitLoad && bol.customerName && bol.secondaryRailcarID) {
+    if (inventorySource === 'railcar' && splitLoad && bol.customerName && bol.secondaryRailcarID) {
       bol.secondaryRailShipmentBolNumber = await findActiveRailcarShipmentBol({
         customerId: bol.customerName,
         railcarID: bol.secondaryRailcarID,
@@ -572,11 +791,108 @@ router.put('/:id/complete', authorizeRoles(['internal', 'admin']), completionVal
       bol.secondaryRailShipmentBolNumber = '';
     }
 
+    let consumedWeight = null;
+    let consumedPrimaryWeight = null;
+    let consumedSecondaryWeight = null;
+    let consumedPrimaryLot = null;
+    let consumedSecondaryLot = null;
+    if (inventorySource === 'ground') {
+      consumedPrimaryWeight = primaryGrossWeight - primaryTareWeight;
+      consumedSecondaryWeight = splitLoad ? (secondaryGrossWeight - secondaryTareWeight) : 0;
+      consumedWeight = consumedPrimaryWeight + consumedSecondaryWeight;
+      if (!Number.isFinite(consumedWeight)) {
+        return res.status(400).json({ message: 'Unable to determine consumed ground inventory weight' });
+      }
+      if (consumedPrimaryWeight < 0 || consumedSecondaryWeight < 0 || consumedWeight < 0) {
+        return res.status(400).json({ message: 'Computed ground inventory consumption cannot be negative' });
+      }
+
+      const consumePrimaryResult = await consumeGroundInventoryLot({
+        lotId: bol.groundInventoryLot,
+        customerId: bol.customerName,
+        materialId: bol.materialName,
+        weight: consumedPrimaryWeight,
+      });
+      if (!consumePrimaryResult.ok) {
+        return res.status(400).json({ message: consumePrimaryResult.message });
+      }
+      consumedPrimaryLot = consumePrimaryResult.lot;
+
+      if (splitLoad) {
+        const consumeSecondaryResult = await consumeGroundInventoryLot({
+          lotId: bol.secondaryGroundInventoryLot,
+          customerId: bol.customerName,
+          materialId: bol.materialName,
+          weight: consumedSecondaryWeight,
+        });
+        if (!consumeSecondaryResult.ok) {
+          if (consumedPrimaryLot && Number(consumedPrimaryWeight || 0) > 0) {
+            await GroundInventoryLot.findByIdAndUpdate(consumedPrimaryLot._id, {
+              $inc: { remainingWeight: consumedPrimaryWeight },
+              $set: { status: 'available' },
+            });
+          }
+          return res.status(400).json({ message: consumeSecondaryResult.message });
+        }
+        consumedSecondaryLot = consumeSecondaryResult.lot;
+      }
+    }
+
     bol.status = 'Completed';
     bol.completedAt = new Date();
     bol.completedBy = req.user.id;
+    bol.groundInventoryAllocatedWeight = inventorySource === 'ground' ? consumedWeight : null;
+    bol.secondaryGroundInventoryAllocatedWeight = inventorySource === 'ground' && splitLoad ? consumedSecondaryWeight : null;
 
-    const saved = await bol.save();
+    let saved;
+    try {
+      saved = await bol.save();
+    } catch (saveErr) {
+      if (inventorySource === 'ground') {
+        if (consumedPrimaryLot && Number(consumedPrimaryWeight || 0) > 0) {
+          await GroundInventoryLot.findByIdAndUpdate(consumedPrimaryLot._id, {
+            $inc: { remainingWeight: consumedPrimaryWeight },
+            $set: { status: 'available' },
+          });
+        }
+        if (consumedSecondaryLot && Number(consumedSecondaryWeight || 0) > 0) {
+          await GroundInventoryLot.findByIdAndUpdate(consumedSecondaryLot._id, {
+            $inc: { remainingWeight: consumedSecondaryWeight },
+            $set: { status: 'available' },
+          });
+        }
+      }
+      throw saveErr;
+    }
+
+    if (inventorySource === 'ground') {
+      const allocationsToCreate = [];
+      if (consumedPrimaryLot && Number(consumedPrimaryWeight || 0) > 0) {
+        allocationsToCreate.push({
+          lotId: consumedPrimaryLot._id,
+          bolId: saved._id,
+          customerName: saved.customerName,
+          materialName: saved.materialName,
+          allocatedWeight: consumedPrimaryWeight,
+          allocationType: 'bol_completion',
+          createdBy: req.user.id,
+        });
+      }
+      if (consumedSecondaryLot && Number(consumedSecondaryWeight || 0) > 0) {
+        allocationsToCreate.push({
+          lotId: consumedSecondaryLot._id,
+          bolId: saved._id,
+          customerName: saved.customerName,
+          materialName: saved.materialName,
+          allocatedWeight: consumedSecondaryWeight,
+          allocationType: 'bol_completion',
+          createdBy: req.user.id,
+        });
+      }
+      if (allocationsToCreate.length) {
+        await GroundInventoryAllocation.insertMany(allocationsToCreate);
+      }
+    }
 
     res.status(200).json({ message: 'BOL completed successfully', bol: saved });
   } catch (err) {

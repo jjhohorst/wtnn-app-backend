@@ -171,7 +171,7 @@ router.post(
       const email = normalizeEmail(req.body.email);
       const password = String(req.body.password || '');
 
-      const user = await User.findOne({ email }).populate('customerName', 'customerName customerLogo');
+      const user = await User.findOne({ email }).populate('customerName', 'customerName customerLogo enableGroundInventory');
       if (!user) {
         return res.status(401).json({ message: 'Invalid email or password' });
       }

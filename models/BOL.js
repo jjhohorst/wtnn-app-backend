@@ -32,6 +32,24 @@ const bolSchema = new mongoose.Schema({
     ref: 'Material',
     required: true,
   },
+  inventorySource: {
+    type: String,
+    enum: ['railcar', 'ground'],
+    default: 'railcar',
+    title: 'Inventory Source',
+  },
+  groundInventoryLot: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'GroundInventoryLot',
+    title: 'Ground Inventory Lot',
+  },
+  secondaryGroundInventoryLot: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'GroundInventoryLot',
+    title: 'Secondary Ground Inventory Lot',
+  },
+  groundInventoryAllocatedWeight: { type: Number, title: 'Ground Inventory Allocated Weight' },
+  secondaryGroundInventoryAllocatedWeight: { type: Number, title: 'Secondary Ground Inventory Allocated Weight' },
   status: {
     type: String,
     enum: ['Draft', 'Completed'],
@@ -55,7 +73,13 @@ const bolSchema = new mongoose.Schema({
   driverName: { type: String, title: 'Driver Name' },
   driverSignatureImage: { type: String, title: 'Driver Signature Image (Data URL)' },
   signedAt: { type: Date, title: 'Driver Signed At' },
-  railcarID: { type: String, required: true, title: 'Railcar #' },
+  railcarID: {
+    type: String,
+    required() {
+      return this.inventorySource !== 'ground';
+    },
+    title: 'Railcar #',
+  },
   railShipmentBolNumber: { type: String, title: 'Rail Shipment BOL Number (Primary)' },
   secondaryRailShipmentBolNumber: { type: String, title: 'Rail Shipment BOL Number (Secondary)' },
   truckID: { type: String, required: true, title: 'Truck #' },
@@ -75,8 +99,17 @@ const bolSchema = new mongoose.Schema({
 });
 
 bolSchema.pre('validate', function (next) {
+  if (this.inventorySource === 'ground') {
+    this.secondaryRailcarID = '';
+    this.railShipmentBolNumber = '';
+    this.secondaryRailShipmentBolNumber = '';
+  } else {
+    this.secondaryGroundInventoryLot = null;
+    this.secondaryGroundInventoryAllocatedWeight = null;
+  }
+
   const hasPrimaryWeights = this.grossWeight != null && this.tareWeight != null;
-  const hasSecondaryWeights = this.secondaryGrossWeight != null && this.secondaryTareWeight != null;
+  const hasSecondaryWeights = Boolean(this.splitLoad) && this.secondaryGrossWeight != null && this.secondaryTareWeight != null;
 
   if (hasPrimaryWeights) {
     this.primaryNetWeight = this.grossWeight - this.tareWeight;

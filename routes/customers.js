@@ -34,6 +34,14 @@ const parseLoadGoalMinutesInput = (value) => {
 
   return { provided: true, value: rounded };
 };
+const parseGroundInventoryToggleInput = (value) => {
+  if (value === undefined) return { provided: false };
+  if (typeof value === 'boolean') return { provided: true, value };
+  const normalized = String(value || '').trim().toLowerCase();
+  if (['true', '1', 'yes', 'y'].includes(normalized)) return { provided: true, value: true };
+  if (['false', '0', 'no', 'n'].includes(normalized)) return { provided: true, value: false };
+  return { provided: true, error: 'Ground inventory toggle must be true or false' };
+};
 
 router.use(requireAuth);
 
@@ -54,6 +62,10 @@ router.post(
       .optional({ nullable: true, checkFalsy: false })
       .isFloat({ min: 1, max: MAX_LOAD_GOAL_MINUTES })
       .withMessage(`Average load goal must be between 1 and ${MAX_LOAD_GOAL_MINUTES} minutes`),
+    body('enableGroundInventory')
+      .optional({ nullable: true, checkFalsy: false })
+      .isBoolean()
+      .withMessage('Ground inventory toggle must be true or false'),
   ],
   async (req, res) => {
     const errors = validationResult(req);
@@ -82,6 +94,14 @@ router.post(
         }
       } else {
         payload.loadGoalMinutes = DEFAULT_LOAD_GOAL_MINUTES;
+      }
+
+      const parsedGroundInventory = parseGroundInventoryToggleInput(payload.enableGroundInventory);
+      if (parsedGroundInventory.error) {
+        return res.status(400).json({ message: parsedGroundInventory.error });
+      }
+      if (parsedGroundInventory.provided) {
+        payload.enableGroundInventory = parsedGroundInventory.value;
       }
 
       const newCustomer = new Customer(payload);
@@ -193,6 +213,14 @@ router.put('/:id', authorizeRoles(['internal', 'admin']), async (req, res) => {
       } else {
         setPayload.loadGoalMinutes = parsedLoadGoal.value;
       }
+    }
+
+    const parsedGroundInventory = parseGroundInventoryToggleInput(payload.enableGroundInventory);
+    if (parsedGroundInventory.error) {
+      return res.status(400).json({ message: parsedGroundInventory.error });
+    }
+    if (parsedGroundInventory.provided) {
+      setPayload.enableGroundInventory = parsedGroundInventory.value;
     }
 
     const updateDoc = { $set: setPayload };

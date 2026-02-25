@@ -5,6 +5,7 @@ const Customer = require('../models/Customer');
 const BOL = require('../models/BOL');
 const User = require('../models/User');
 const Material = require('../models/Material');
+const GroundInventoryLot = require('../models/GroundInventoryLot');
 const {
   requireAuth,
   authorizeRoles,
@@ -256,6 +257,9 @@ const parseBooleanParam = (value, fallback = false) => {
   if (['0', 'false', 'no', 'n'].includes(raw)) return false;
   return fallback;
 };
+
+const buildGroundConversionToken = ({ customerId, railcarId, railShipmentBolNumber, railcarDocId }) =>
+  [String(customerId || '').trim(), String(railcarId || '').trim(), String(railShipmentBolNumber || '').trim(), String(railcarDocId || '').trim()].join('|');
 
 const fetchRailcarsWithComputedWeights = async (query) => {
   const railcars = await Railcar.find(query)
@@ -820,6 +824,48 @@ router.put('/:id/release-empty', authorizeRoles(['customer', 'internal', 'admin'
     railcar.releasedAsEmptyAt = new Date();
     railcar.releasedAsEmptyBy = req.user?.id || railcar.releasedAsEmptyBy;
 
+    const [scopedWithWeight] = await fetchRailcarsWithComputedWeights({ _id: railcar._id });
+    const remainingWeight = Number(scopedWithWeight?.remainingWeight || 0);
+    const customer = await Customer.findById(railcar.customerName).select('customerName enableGroundInventory');
+
+    let conversionResult = null;
+    const shouldConvertToGround =
+      (req.user?.role === 'internal' || req.user?.role === 'admin')
+      && Boolean(customer?.enableGroundInventory)
+      && railcar.materialName
+      && remainingWeight > 0;
+
+    if (shouldConvertToGround) {
+      const conversionToken = buildGroundConversionToken({
+        customerId: railcar.customerName,
+        railcarId: railcar.railcarID,
+        railShipmentBolNumber: railcar.railcarBolNumber,
+        railcarDocId: railcar._id,
+      });
+
+      const existingLot = await GroundInventoryLot.findOne({ conversionToken }).select('_id');
+      if (!existingLot) {
+        const lot = await GroundInventoryLot.create({
+          customerName: railcar.customerName,
+          materialName: railcar.materialName,
+          sourceType: 'railcar_conversion',
+          sourceRailcarDocId: railcar._id,
+          sourceRailcarID: railcar.railcarID || '',
+          sourceRailShipmentBolNumber: railcar.railcarBolNumber || '',
+          conversionToken,
+          startingWeight: remainingWeight,
+          remainingWeight,
+          receivedAt: new Date(),
+          receivedBy: req.user?.id || null,
+          status: 'available',
+          notes: 'Auto-converted during release as empty',
+        });
+        conversionResult = { created: true, lotId: lot._id, startingWeight: lot.startingWeight };
+      } else {
+        conversionResult = { created: false, lotId: existingLot._id };
+      }
+    }
+
     const saved = await railcar.save();
 
     try {
@@ -832,7 +878,10 @@ router.put('/:id/release-empty', authorizeRoles(['customer', 'internal', 'admin'
       console.error('Railcar release email notification failed:', emailErr);
     }
 
-    res.status(200).json({ message: 'Railcar released as empty', railcar: saved });
+    const message = conversionResult?.created
+      ? 'Railcar released as empty and converted to ground inventory'
+      : 'Railcar released as empty';
+    res.status(200).json({ message, railcar: saved, conversion: conversionResult });
   } catch (err) {
     console.error('Error releasing railcar as empty:', err);
     res.status(500).json({ message: 'Server error while releasing railcar' });
