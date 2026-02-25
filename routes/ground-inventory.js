@@ -279,10 +279,34 @@ router.get('/allocations', authorizeRoles(['internal', 'admin']), async (req, re
       query.bolId = req.query.bolId;
     }
 
+    if (req.query.lotId) {
+      if (!isValidObjectId(req.query.lotId)) {
+        return res.status(400).json({ message: 'Invalid lotId query parameter' });
+      }
+      query.lotId = req.query.lotId;
+    }
+
     const allocations = await GroundInventoryAllocation.find(query)
       .sort({ createdAt: -1 })
       .populate('lotId')
-      .populate('bolId', 'orderNumber bolDate status')
+      .populate({
+        path: 'bolId',
+        select: 'orderNumber projectName bolDate status netWeight tonWeight',
+        populate: [
+          {
+            path: 'orderNumber',
+            select: 'orderNumber projectName',
+            populate: {
+              path: 'projectName',
+              select: 'projectName',
+            },
+          },
+          {
+            path: 'projectName',
+            select: 'projectName',
+          },
+        ],
+      })
       .populate('customerName', 'customerName')
       .populate('materialName', 'materialName refNum')
       .populate('createdBy', 'firstName lastName fullName email');
